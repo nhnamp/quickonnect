@@ -12,6 +12,7 @@ from client.network.connection import ConnectionManager
 from client.storage.local_store import LocalStore
 from client.ui.chat_widget import ChatWidget
 from client.ui.friend_list_widget import FriendListWidget
+from client.ui.screen_share_widget import ScreenShareWidget
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,8 @@ class MainWindow(QMainWindow):
 
         self._chat_btn = QPushButton("Chat")
         self._friends_btn = QPushButton("Friends")
-        for btn in [self._chat_btn, self._friends_btn]:
+        self._screen_btn = QPushButton("Screen")
+        for btn in [self._chat_btn, self._friends_btn, self._screen_btn]:
             btn.setStyleSheet(
                 "QPushButton { color: white; background: #2c3e50; padding: 8px; border: none; }"
                 "QPushButton:hover { background: #1abc9c; }"
@@ -83,9 +85,11 @@ class MainWindow(QMainWindow):
 
         self._chat_btn.clicked.connect(lambda: self._stack.setCurrentIndex(0))
         self._friends_btn.clicked.connect(lambda: self._stack.setCurrentIndex(1))
+        self._screen_btn.clicked.connect(lambda: self._stack.setCurrentIndex(2))
 
         sidebar_layout.addWidget(self._chat_btn)
         sidebar_layout.addWidget(self._friends_btn)
+        sidebar_layout.addWidget(self._screen_btn)
         sidebar_layout.addStretch()
 
         body_layout.addWidget(sidebar)
@@ -100,8 +104,13 @@ class MainWindow(QMainWindow):
         self._friend_widget.send_packet.connect(self._send_packet)
         self._friend_widget.start_dm.connect(self._on_start_dm)
 
+        self._screen_widget = ScreenShareWidget(self._conn, self._user_id, self._username)
+        self._screen_widget.send_packet.connect(self._send_packet)
+        self._chat_widget.room_changed.connect(self._screen_widget.set_current_room)
+
         self._stack.addWidget(self._chat_widget)
         self._stack.addWidget(self._friend_widget)
+        self._stack.addWidget(self._screen_widget)
 
         body_layout.addWidget(self._stack)
         main_layout.addWidget(body)
@@ -132,6 +141,9 @@ class MainWindow(QMainWindow):
             room_id = data.get("room_id", 0)
             self._chat_widget.add_room(room_code, room_id)
             self._stack.setCurrentIndex(0)
+            # Phase 2: surface any active share that already exists in the room.
+            self._screen_widget.set_current_room(room_code)
+            self._screen_widget.handle_room_state_screen(data.get("screen"))
 
         elif ptype == PacketType.MESSAGE_HISTORY:
             room_id = data.get("room_id", 0)
@@ -153,6 +165,24 @@ class MainWindow(QMainWindow):
 
         elif ptype == PacketType.FRIEND_UPDATE:
             self._friend_widget.handle_friend_update(data)
+
+        elif ptype == PacketType.SCREEN_START:
+            self._screen_widget.on_screen_start(data)
+
+        elif ptype == PacketType.SCREEN_STOP:
+            self._screen_widget.on_screen_stop(data)
+
+        elif ptype == PacketType.SCREEN_RELAY:
+            self._screen_widget.on_screen_relay(data)
+
+        elif ptype == PacketType.REMOTE_REQUEST:
+            self._screen_widget.on_remote_request(data)
+
+        elif ptype == PacketType.REMOTE_GRANT:
+            self._screen_widget.on_remote_grant(data)
+
+        elif ptype == PacketType.REMOTE_EVENT:
+            self._screen_widget.on_remote_event(data)
 
         elif ptype == PacketType.ERROR:
             code = data.get("code", 0)
@@ -185,6 +215,7 @@ class MainWindow(QMainWindow):
 
     def _on_logout(self):
         self._poll_timer.stop()
+        self._screen_widget.shutdown()
         self._store.clear_session()
         self._conn.disconnect()
         self.logout_requested.emit()
@@ -195,12 +226,14 @@ class MainWindow(QMainWindow):
 
     def _show_disconnect(self, reason: str):
         self._poll_timer.stop()
+        self._screen_widget.shutdown()
         QMessageBox.warning(self, "Disconnected", f"Lost connection: {reason}")
         self.logout_requested.emit()
         self.close()
 
     def closeEvent(self, event):
         self._poll_timer.stop()
+        self._screen_widget.shutdown()
         if self._conn.connected:
             self._conn.disconnect()
         event.accept()

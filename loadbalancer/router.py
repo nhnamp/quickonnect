@@ -63,8 +63,16 @@ class Router:
                 pass
 
     def _resolve(self, room_code: str | None):
-        """Resolve which server to route to."""
-        if room_code:
+        """Resolve which server to route to.
+
+        DM rooms (codes prefixed with 'DM-') are server-agnostic: the LB does
+        not look up or write a room->server pin for them. The two participants
+        may end up on different chat servers; cross-server delivery happens
+        via Redis pub/sub on the 'dm_messages' channel.
+        """
+        is_dm = bool(room_code) and room_code.startswith("DM-")
+
+        if room_code and not is_dm:
             server_id = self._get_room_server(room_code)
             if server_id:
                 info = self._hc.get_server_info(server_id)
@@ -73,7 +81,7 @@ class Router:
                 logger.warning("Room %s mapped to server %s which is DOWN", room_code, server_id)
 
         target = self._hc.get_least_loaded()
-        if target and room_code:
+        if target and room_code and not is_dm:
             self._set_room_server(room_code, target.server_id)
 
         return target

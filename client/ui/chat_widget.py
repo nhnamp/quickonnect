@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class ChatWidget(QWidget):
     """Chat panel: room list on the left, message view on the right."""
     send_packet = pyqtSignal(int, dict)  # packet_type, payload
+    room_changed = pyqtSignal(str)       # emitted when _current_room changes (Phase 2 hookup)
 
     def __init__(self):
         super().__init__()
@@ -111,6 +112,7 @@ class ChatWidget(QWidget):
         self._update_message_view()
         self._msg_input.setEnabled(True)
         self._send_btn.setEnabled(True)
+        self.room_changed.emit(room_code)
 
     def _select_room_in_list(self, room_code: str):
         for i in range(self._room_list.count()):
@@ -123,10 +125,13 @@ class ChatWidget(QWidget):
         if current is None:
             return
         room_code = current.data(Qt.ItemDataRole.UserRole)
+        if room_code == self._current_room:
+            return
         self._current_room = room_code
         self._update_message_view()
         self._msg_input.setEnabled(True)
         self._send_btn.setEnabled(True)
+        self.room_changed.emit(room_code)
 
     # ------------------------------------------------------------------
     # Messages

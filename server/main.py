@@ -111,6 +111,13 @@ class ChatServer:
         with self._clients_lock:
             return self._clients.get(user_id)
 
+    def get_client_by_username(self, username: str):
+        with self._clients_lock:
+            for handler in self._clients.values():
+                if handler.username == username:
+                    return handler
+        return None
+
     def get_server_address(self, server_id: str) -> tuple[str, int] | None:
         try:
             data = self._redis.hget("servers", server_id)
@@ -127,12 +134,23 @@ class ChatServer:
         except Exception:
             logger.warning("Failed to publish friend event")
 
+    def publish_dm_message(self, recipient_username: str, msg_data: dict) -> None:
+        """Publish a DM message so the recipient's server can deliver it."""
+        try:
+            self._redis.publish("dm_messages", json.dumps({
+                "recipient_username": recipient_username,
+                "message": msg_data,
+                "originating_server_id": self.config.server_id,
+            }))
+        except Exception:
+            logger.warning("Failed to publish DM message")
+
     # ------------------------------------------------------------------
     # Redis pub/sub
     # ------------------------------------------------------------------
 
     def _start_pubsub_listener(self):
-        self._pubsub.subscribe("user_status", "friend_events")
+        self._pubsub.subscribe("user_status", "friend_events", "dm_messages")
         self._pubsub_thread = threading.Thread(target=self._pubsub_loop, daemon=True)
         self._pubsub_thread.start()
 
@@ -152,6 +170,8 @@ class ChatServer:
                     self._handle_user_status(data)
                 elif channel == "friend_events":
                     self._handle_friend_event(data)
+                elif channel == "dm_messages":
+                    self._handle_dm_message(data)
             except Exception:
                 logger.debug("Failed to process pub/sub message")
 
@@ -195,6 +215,26 @@ class ChatServer:
             handler = self.get_client(to_user_id)
             if handler:
                 handler._send_friend_list()
+
+    def _handle_dm_message(self, data: dict):
+        """Deliver a DM message published by another server.
+
+        Skip messages this server originated — the local delivery path already
+        handled them, and Redis pub/sub echoes back to the publisher.
+        """
+        from shared.constants import PacketType
+
+        if data.get("originating_server_id") == self.config.server_id:
+            return
+
+        recipient_username = data.get("recipient_username", "")
+        msg_data = data.get("message", {})
+        if not recipient_username or not msg_data:
+            return
+
+        handler = self.get_client_by_username(recipient_username)
+        if handler is not None:
+            handler.send(PacketType.CHAT_MESSAGE, msg_data)
 
     # ------------------------------------------------------------------
     # Server registry in Redis

@@ -5,6 +5,7 @@ import random
 
 from shared.models import Room, Participant, RoomState
 from server.services.db import get_connection
+from server.features.screen_relay import ScreenRelayState
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,11 @@ def _generate_room_code() -> str:
     part1 = "".join(random.choices(chars, k=3))
     part2 = "".join(random.choices(chars, k=4))
     return f"{part1}-{part2}"
+
+
+def _is_dm_room(room_code: str) -> bool:
+    """DM rooms are server-agnostic and skip Redis room->server pinning."""
+    return room_code.startswith("DM-")
 
 
 class RoomManager:
@@ -49,17 +55,28 @@ class RoomManager:
         self._register_room_in_redis(room_code)
         return room
 
+    def get_screen_state(self, room_code: str) -> ScreenRelayState | None:
+        """Return the per-room ScreenRelayState, or None if the room is not active here."""
+        with self._lock:
+            room_data = self._rooms.get(room_code)
+            return room_data["screen"] if room_data else None
+
     def join_room(self, room_code: str, user_id: int, username: str, client_handler) -> tuple[RoomState | None, str | None]:
         """
         Join a room. Creates it if it doesn't exist.
         Returns (room_state, error_message).
-        If the room is on another server, error_message contains redirect info.
+        For regular rooms, if the room is on another server the error_message
+        contains redirect info. DM rooms ('DM-' prefix) are server-agnostic:
+        neither the redirect check nor the Redis pin is applied to them, and
+        both participants may join independently on whichever server they are
+        currently connected to.
         """
-        # Check Redis for room -> server mapping
-        server_for_room = self._get_room_server(room_code)
+        dm = _is_dm_room(room_code)
 
-        if server_for_room is not None and server_for_room != self._server_id:
-            return None, f"REDIRECT:{server_for_room}"
+        if not dm:
+            server_for_room = self._get_room_server(room_code)
+            if server_for_room is not None and server_for_room != self._server_id:
+                return None, f"REDIRECT:{server_for_room}"
 
         with self._lock:
             if room_code in self._rooms:
@@ -69,8 +86,13 @@ class RoomManager:
                 room = self._get_or_create_room_in_db(room_code, user_id)
                 if room is None:
                     return None, "Failed to create or find room"
-                self._rooms[room_code] = {"room": room, "clients": {}}
-                self._register_room_in_redis(room_code)
+                self._rooms[room_code] = {
+                    "room": room,
+                    "clients": {},
+                    "screen": ScreenRelayState(),
+                }
+                if not dm:
+                    self._register_room_in_redis(room_code)
                 room_data = self._rooms[room_code]
 
             room_data["clients"][user_id] = client_handler
@@ -95,7 +117,8 @@ class RoomManager:
 
             if not room_data["clients"]:
                 del self._rooms[room_code]
-                self._unregister_room_from_redis(room_code)
+                if not _is_dm_room(room_code):
+                    self._unregister_room_from_redis(room_code)
 
             return remaining
 
@@ -125,7 +148,8 @@ class RoomManager:
                     left_rooms.append(room_code)
                     if not room_data["clients"]:
                         del self._rooms[room_code]
-                        self._unregister_room_from_redis(room_code)
+                        if not _is_dm_room(room_code):
+                            self._unregister_room_from_redis(room_code)
         return left_rooms
 
     def get_connection_count(self) -> int:

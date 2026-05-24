@@ -210,6 +210,12 @@ class ClientHandler(threading.Thread):
             PacketType.FRIEND_REQUEST: self._handle_friend_request,
             PacketType.FRIEND_RESPONSE: self._handle_friend_response,
             PacketType.HEARTBEAT: self._handle_heartbeat,
+            PacketType.SCREEN_START: self._handle_screen_start,
+            PacketType.SCREEN_STOP: self._handle_screen_stop,
+            PacketType.SCREEN_FRAME: self._handle_screen_frame,
+            PacketType.REMOTE_REQUEST: self._handle_remote_request,
+            PacketType.REMOTE_GRANT: self._handle_remote_grant,
+            PacketType.REMOTE_EVENT: self._handle_remote_event,
         }
         handler = handlers.get(packet.packet_type)
         if handler:
@@ -260,7 +266,20 @@ class ClientHandler(threading.Thread):
             return
 
         self._current_rooms.add(room_code)
-        self.send(PacketType.ROOM_STATE, state.to_dict())
+        state_payload = state.to_dict()
+        # If a screen share is already in progress in this room, tell the
+        # joining client right away so its UI can show the active share
+        # without waiting for the next frame.
+        screen = room_manager.get_screen_state(room_code)
+        if screen is not None and screen.is_sharing():
+            info = screen.get_state()
+            state_payload["screen"] = {
+                "sharer_user_id": info.sharer_user_id,
+                "sharer_username": info.sharer_username,
+                "controller_user_id": info.controller_user_id,
+                "controller_username": info.controller_username,
+            }
+        self.send(PacketType.ROOM_STATE, state_payload)
 
         history = self._server.message_service.get_history(state.room_id)
         self.send(PacketType.MESSAGE_HISTORY, {
@@ -283,6 +302,38 @@ class ClientHandler(threading.Thread):
         if not room_code:
             return
 
+        # Phase 2: surrender any share / control grant this user owned in
+        # this room before we drop them from the participant list, so the
+        # remaining members get the SCREEN_STOP / REMOTE_GRANT notification.
+        screen = self._server.room_manager.get_screen_state(room_code)
+        screen_stopped = False
+        controller_cleared_info = None
+        if screen is not None:
+            if screen.stop_if_sharer(self.user_id):
+                screen_stopped = True
+            elif screen.clear_controller_if(self.user_id):
+                controller_cleared_info = screen.get_state()
+
+        if screen_stopped:
+            clients = self._server.room_manager.get_room_clients(room_code)
+            for uid, handler in clients.items():
+                if uid != self.user_id:
+                    handler.send(PacketType.SCREEN_STOP, {
+                        "room_code": room_code,
+                        "sharer_user_id": self.user_id,
+                    })
+        elif controller_cleared_info is not None:
+            clients = self._server.room_manager.get_room_clients(room_code)
+            for uid, handler in clients.items():
+                if uid != self.user_id:
+                    handler.send(PacketType.REMOTE_GRANT, {
+                        "room_code": room_code,
+                        "granted": False,
+                        "target_user_id": None,
+                        "target_username": None,
+                        "sharer_user_id": controller_cleared_info.sharer_user_id,
+                    })
+
         self._current_rooms.discard(room_code)
         remaining = self._server.room_manager.leave_room(room_code, self.user_id)
 
@@ -302,6 +353,40 @@ class ClientHandler(threading.Thread):
         if not room_code or not content:
             return
 
+        is_dm = room_code.startswith("DM-")
+
+        if is_dm:
+            # DM rooms are server-agnostic. The sender may not be in this
+            # server's _rooms[room_code]["clients"] for either of two
+            # reasons:
+            #   (a) the room does not exist on this server at all — the
+            #       sender only received earlier DMs via the Redis push
+            #       fallback (cross-server case);
+            #   (b) the room DOES exist locally because the OTHER
+            #       participant joined here first, but the sender
+            #       themselves was delivered earlier DMs via the same-
+            #       server local push path in _handle_chat_message and was
+            #       never added to clients.
+            # In both cases, the broadcast loop below would skip the
+            # sender — the sender would never see their own message echoed
+            # back even though the recipient receives it normally. The
+            # trigger we need is "sender not in local clients", not "room
+            # not found". join_room is idempotent on the (room, clients)
+            # map; we only invoke it when the sender is genuinely absent
+            # so we don't accumulate redundant room_participants rows.
+            clients_now = self._server.room_manager.get_room_clients(room_code)
+            if self.user_id not in clients_now:
+                state, lazy_error = self._server.room_manager.join_room(
+                    room_code, self.user_id, self.username, self,
+                )
+                if lazy_error or state is None:
+                    self.send(PacketType.ERROR, {
+                        "code": 500,
+                        "message": lazy_error or "Failed to open DM room",
+                    })
+                    return
+                self._current_rooms.add(room_code)
+
         room = self._server.room_manager.get_room(room_code)
         if room is None:
             self.send(PacketType.ERROR, {"code": 404, "message": "Room not found"})
@@ -319,6 +404,212 @@ class ClientHandler(threading.Thread):
         clients = self._server.room_manager.get_room_clients(room_code)
         for uid, handler in clients.items():
             handler.send(PacketType.CHAT_MESSAGE, msg_data)
+
+        # DM push: if this is a DM room, also push to the recipient even if they
+        # have not joined the room locally. DM rooms are server-agnostic, so a
+        # recipient connected to a different chat server is reached via Redis
+        # pub/sub.
+        if is_dm:
+            recipient_username = self._extract_dm_recipient(room_code)
+            if recipient_username:
+                already_delivered = any(
+                    h.username == recipient_username for h in clients.values()
+                )
+                if not already_delivered:
+                    local = self._server.get_client_by_username(recipient_username)
+                    if local is not None:
+                        local.send(PacketType.CHAT_MESSAGE, msg_data)
+                    else:
+                        self._server.publish_dm_message(recipient_username, msg_data)
+
+    def _extract_dm_recipient(self, room_code: str) -> str | None:
+        """Given a DM room code, return the other participant's username.
+
+        The room code format is 'DM-{sorted_name_1}-{sorted_name_2}'. We
+        anchor on this user's known username so usernames containing a hyphen
+        still parse correctly.
+        """
+        inner = room_code[3:]
+        prefix = self.username + "-"
+        suffix = "-" + self.username
+        if inner.startswith(prefix):
+            return inner[len(prefix):]
+        if inner.endswith(suffix):
+            return inner[:-len(suffix)]
+        return None
+
+    # ------------------------------------------------------------------
+    # Screen sharing & remote control
+    # ------------------------------------------------------------------
+
+    def _resolve_screen_room(self, packet: Packet) -> tuple[str | None, object | None]:
+        """Look up the screen-relay state for the room named in the packet.
+
+        Returns (room_code, screen_state) or (None, None) after sending an
+        ERROR packet back to the client. The caller may bail out on (None, _).
+        """
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Room code required"})
+            return None, None
+        if room_code not in self._current_rooms:
+            self.send(PacketType.ERROR, {"code": 403, "message": "Not in this room"})
+            return None, None
+        screen = self._server.room_manager.get_screen_state(room_code)
+        if screen is None:
+            self.send(PacketType.ERROR, {"code": 404, "message": "Room not found"})
+            return None, None
+        return room_code, screen
+
+    def _broadcast_to_room(self, room_code: str, packet_type: PacketType, payload: dict,
+                          include_self: bool = True) -> None:
+        clients = self._server.room_manager.get_room_clients(room_code)
+        for uid, handler in clients.items():
+            if not include_self and uid == self.user_id:
+                continue
+            handler.send(packet_type, payload)
+
+    def _handle_screen_start(self, packet: Packet):
+        room_code, screen = self._resolve_screen_room(packet)
+        if room_code is None:
+            return
+        ok, error = screen.start_share(self.user_id, self.username)
+        if not ok:
+            self.send(PacketType.ERROR, {"code": 409, "message": error or "Cannot start share"})
+            return
+        self._broadcast_to_room(room_code, PacketType.SCREEN_START, {
+            "room_code": room_code,
+            "sharer_user_id": self.user_id,
+            "sharer_username": self.username,
+        })
+
+    def _handle_screen_stop(self, packet: Packet):
+        room_code, screen = self._resolve_screen_room(packet)
+        if room_code is None:
+            return
+        if not screen.stop_share(self.user_id):
+            # Not the sharer or no active share: silently ignore — the client
+            # is already in the right state from its own UI's perspective.
+            return
+        self._broadcast_to_room(room_code, PacketType.SCREEN_STOP, {
+            "room_code": room_code,
+            "sharer_user_id": self.user_id,
+        })
+
+    def _handle_screen_frame(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        screen = self._server.room_manager.get_screen_state(room_code)
+        if screen is None or screen.sharer_user_id() != self.user_id:
+            # Frames from a non-sharer are dropped without an error: a stale
+            # frame in flight after a stop is not a protocol violation.
+            return
+        relay_payload = {
+            "room_code": room_code,
+            "sharer_user_id": self.user_id,
+            "jpeg_b64": packet.payload.get("jpeg_b64", ""),
+            "width": packet.payload.get("width", 0),
+            "height": packet.payload.get("height", 0),
+            "seq": packet.payload.get("seq", 0),
+        }
+        self._broadcast_to_room(room_code, PacketType.SCREEN_RELAY, relay_payload,
+                                include_self=False)
+
+    def _handle_remote_request(self, packet: Packet):
+        room_code, screen = self._resolve_screen_room(packet)
+        if room_code is None:
+            return
+        info = screen.get_state()
+        if info is None:
+            self.send(PacketType.ERROR, {"code": 409, "message": "No active screen share"})
+            return
+        if info.sharer_user_id == self.user_id:
+            self.send(PacketType.ERROR, {"code": 400, "message": "You are the sharer"})
+            return
+        sharer = self._server.room_manager.get_room_clients(room_code).get(info.sharer_user_id)
+        if sharer is None:
+            self.send(PacketType.ERROR, {"code": 410, "message": "Sharer is no longer connected"})
+            return
+        sharer.send(PacketType.REMOTE_REQUEST, {
+            "room_code": room_code,
+            "requester_user_id": self.user_id,
+            "requester_username": self.username,
+        })
+
+    def _handle_remote_grant(self, packet: Packet):
+        room_code, screen = self._resolve_screen_room(packet)
+        if room_code is None:
+            return
+        target_user_id = packet.payload.get("target_user_id")
+        granted = bool(packet.payload.get("granted", False))
+
+        info = screen.get_state()
+        if info is None or info.sharer_user_id != self.user_id:
+            self.send(PacketType.ERROR, {
+                "code": 403, "message": "Only the active sharer can grant remote control",
+            })
+            return
+
+        if granted:
+            target_handler = self._server.room_manager.get_room_clients(room_code).get(target_user_id)
+            if target_handler is None:
+                self.send(PacketType.ERROR, {
+                    "code": 410, "message": "Target user is no longer in this room",
+                })
+                return
+            ok, error = screen.set_controller(self.user_id, target_user_id, target_handler.username)
+            if not ok:
+                self.send(PacketType.ERROR, {"code": 500, "message": error or "Failed to grant"})
+                return
+        else:
+            # Either denying a request or revoking a previously granted controller.
+            # set_controller(None) handles both — it clears the slot.
+            ok, error = screen.set_controller(self.user_id, None, None)
+            if not ok:
+                self.send(PacketType.ERROR, {"code": 500, "message": error or "Failed to update"})
+                return
+
+        # Tell every room participant about the new control state, so viewers
+        # can update their UI (the controller sees their granted indicator;
+        # others see "X has remote control" or that the slot is free).
+        self._broadcast_to_room(room_code, PacketType.REMOTE_GRANT, {
+            "room_code": room_code,
+            "granted": granted,
+            "target_user_id": target_user_id if granted else None,
+            "target_username": (
+                self._server.room_manager.get_room_clients(room_code)
+                .get(target_user_id).username if granted and target_user_id is not None
+                and self._server.room_manager.get_room_clients(room_code).get(target_user_id)
+                else None
+            ),
+            "sharer_user_id": self.user_id,
+        })
+
+    def _handle_remote_event(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        screen = self._server.room_manager.get_screen_state(room_code)
+        if screen is None:
+            return
+        info = screen.get_state()
+        if info is None:
+            return
+        if info.controller_user_id != self.user_id:
+            # Silently drop — a stale event after a revoke is not an error.
+            return
+        sharer = self._server.room_manager.get_room_clients(room_code).get(info.sharer_user_id)
+        if sharer is None:
+            return
+        # Forward verbatim — the host's executor reads what it needs.
+        forward = dict(packet.payload)
+        forward["controller_user_id"] = self.user_id
+        sharer.send(PacketType.REMOTE_EVENT, forward)
+
+    # ------------------------------------------------------------------
+    # Friends
+    # ------------------------------------------------------------------
 
     def _handle_friend_request(self, packet: Packet):
         target_username = packet.payload.get("target_username", "").strip()
@@ -384,6 +675,35 @@ class ClientHandler(threading.Thread):
     def _cleanup(self):
         self._running = False
         if self.user_id is not None:
+            # Phase 2: if this user owned a screen share or held the remote
+            # control grant in any of their rooms, stop/revoke and notify the
+            # remaining members. Done BEFORE remove_client_from_all_rooms so
+            # the recipient list is still intact.
+            for room_code in list(self._current_rooms):
+                screen = self._server.room_manager.get_screen_state(room_code)
+                if screen is None:
+                    continue
+                if screen.stop_if_sharer(self.user_id):
+                    clients = self._server.room_manager.get_room_clients(room_code)
+                    for uid, handler in clients.items():
+                        if uid != self.user_id:
+                            handler.send(PacketType.SCREEN_STOP, {
+                                "room_code": room_code,
+                                "sharer_user_id": self.user_id,
+                            })
+                elif screen.clear_controller_if(self.user_id):
+                    info = screen.get_state()
+                    clients = self._server.room_manager.get_room_clients(room_code)
+                    for uid, handler in clients.items():
+                        if uid != self.user_id:
+                            handler.send(PacketType.REMOTE_GRANT, {
+                                "room_code": room_code,
+                                "granted": False,
+                                "target_user_id": None,
+                                "target_username": None,
+                                "sharer_user_id": info.sharer_user_id if info else None,
+                            })
+
             left_rooms = self._server.room_manager.remove_client_from_all_rooms(self.user_id)
             for room_code in left_rooms:
                 clients = self._server.room_manager.get_room_clients(room_code)
