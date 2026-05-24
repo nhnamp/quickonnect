@@ -1,0 +1,14 @@
+# Shared
+cryptography>=42.0.0
+bcrypt>=4.1.0
+
+# Server
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.1.0
+redis>=5.0.0
+
+# Client
+PyQt6>=6.6.0
+
+# Development / Testing
+pytest>=8.0.0
