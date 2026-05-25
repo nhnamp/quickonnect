@@ -5,7 +5,7 @@ Two background threads cooperate when the local user is sharing their screen:
   capture thread ──► bounded queue ──► send thread ──► ConnectionManager.send
        │
        └── grabs the primary monitor with mss, builds a QImage, encodes JPEG
-           via QBuffer at the configured quality, and tries to enqueue the
+           via QBuffer at the fixed quality, and tries to enqueue the
            frame. If the queue is full (the network can't keep up) the
            oldest queued frame is dropped first — never block the capture.
 
@@ -23,6 +23,7 @@ import base64
 import logging
 import threading
 import time
+import traceback
 from collections import deque
 
 from PyQt6.QtCore import QObject, QBuffer, QByteArray, QIODevice, pyqtSignal
@@ -37,29 +38,25 @@ logger = logging.getLogger(__name__)
 # in-flight latency the network layer can introduce: at 30 FPS, 3 frames
 # is ~100 ms worst case before frames start being dropped.
 SEND_QUEUE_MAX = 3
+SCREEN_CAPTURE_FPS = 30
+SCREEN_JPEG_QUALITY = 75
+SCREEN_CAPTURE_SCALE = 1.0
 
 
 class ScreenCaptureEngine(QObject):
     """Drives capture + encode + send threads while the local user is sharing.
 
-    Quality and FPS are tunable at runtime via set_quality / set_fps. The
-    engine never touches Qt widgets — frame display lives in the widget,
-    which receives a `frame_dropped` signal so the UI can show diagnostics.
+    The engine never touches Qt widgets — frame display lives in the widget.
     """
 
     frame_sent = pyqtSignal(int)        # seq number of the frame just sent
-    frame_dropped = pyqtSignal(int)     # cumulative dropped-frame count
+    frame_captured = pyqtSignal(QImage) # local preview frame for the sharer
     stopped = pyqtSignal(str)           # reason (empty string = normal stop)
 
     def __init__(self, connection_manager, parent=None) -> None:
         super().__init__(parent)
         self._conn = connection_manager
         self._room_code: str | None = None
-
-        self._quality: int = 70   # JPEG quality 30-95
-        self._fps: int = 30       # 5..30
-        self._scale: float = 1.0  # capture scale 0.25..1.0
-        self._params_lock = threading.Lock()
 
         self._queue: deque = deque()
         self._queue_lock = threading.Lock()
@@ -69,7 +66,7 @@ class ScreenCaptureEngine(QObject):
         self._capture_thread: threading.Thread | None = None
         self._send_thread: threading.Thread | None = None
         self._seq = 0
-        self._dropped_total = 0
+        self._monitor: dict | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -81,14 +78,13 @@ class ScreenCaptureEngine(QObject):
     def start(self, room_code: str) -> tuple[bool, str | None]:
         if self._running:
             return False, "Already sharing"
-        try:
-            import mss  # noqa: F401  (probe import — fails fast on headless hosts)
-        except Exception as exc:
-            return False, f"Screen capture unavailable: {exc}"
+        ok, error = self._preflight_capture()
+        if not ok:
+            logger.error("Screen capture startup failed: %s", error)
+            return False, error
         self._room_code = room_code
         self._running = True
         self._seq = 0
-        self._dropped_total = 0
         self._capture_thread = threading.Thread(
             target=self._capture_loop, name="screen-capture", daemon=True,
         )
@@ -108,25 +104,23 @@ class ScreenCaptureEngine(QObject):
             self._queue_cond.notify_all()
         self.stopped.emit(reason)
 
-    # ------------------------------------------------------------------
-    # Runtime tuning
-    # ------------------------------------------------------------------
-
-    def set_quality(self, quality: int) -> None:
-        with self._params_lock:
-            self._quality = max(30, min(95, int(quality)))
-
-    def set_fps(self, fps: int) -> None:
-        with self._params_lock:
-            self._fps = max(5, min(30, int(fps)))
-
-    def set_scale(self, scale: float) -> None:
-        with self._params_lock:
-            self._scale = max(0.25, min(1.0, float(scale)))
-
-    def _read_params(self) -> tuple[int, int, float]:
-        with self._params_lock:
-            return self._quality, self._fps, self._scale
+    def _preflight_capture(self) -> tuple[bool, str | None]:
+        """Verify that screen capture can actually initialize and grab once."""
+        try:
+            with _open_mss() as sct:
+                monitor, shot = _select_monitor(sct)
+                # Validate conversion/encoding too. A successful grab that
+                # cannot become a JPEG would still produce a black/no-frame UI.
+                qimg = _qimage_from_mss(shot)
+                if qimg.isNull():
+                    return False, "Screen capture unavailable: captured image is empty"
+                jpeg = _encode_jpeg(qimg, SCREEN_JPEG_QUALITY)
+                if not jpeg:
+                    return False, "Screen capture unavailable: could not encode captured frame"
+                self._monitor = dict(monitor)
+            return True, None
+        except BaseException as exc:
+            return False, f"Screen capture unavailable: {exc}"
 
     # ------------------------------------------------------------------
     # Capture / encode loop
@@ -134,37 +128,28 @@ class ScreenCaptureEngine(QObject):
 
     def _capture_loop(self) -> None:
         try:
-            import mss
-        except Exception:
-            logger.exception("mss import failed in capture thread")
-            self.stop("Screen capture not available on this system")
-            return
-
-        try:
-            with mss.mss() as sct:
-                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            with _open_mss() as sct:
+                monitor = self._monitor or _select_monitor(sct)[0]
                 while self._running:
                     frame_start = time.monotonic()
-                    quality, fps, scale = self._read_params()
-                    frame_interval = 1.0 / max(1, fps)
+                    frame_interval = 1.0 / SCREEN_CAPTURE_FPS
 
                     try:
                         shot = sct.grab(monitor)
-                    except Exception:
+                    except BaseException as exc:
                         logger.exception("mss.grab failed")
-                        time.sleep(0.1)
-                        continue
+                        self.stop(f"Screen capture failed: {exc}")
+                        return
 
-                    # mss returns BGRA. Build a QImage from the raw buffer,
-                    # then convert to RGB (smaller, JPEG-natural) and scale.
-                    qimg = QImage(
-                        shot.bgra, shot.width, shot.height, shot.width * 4,
-                        QImage.Format.Format_RGB32,
-                    ).copy()  # copy() detaches from mss's buffer
+                    qimg = _qimage_from_mss(shot)
+                    if qimg.isNull():
+                        logger.error("mss produced an empty image")
+                        self.stop("Screen capture failed: empty frame")
+                        return
 
-                    if scale < 1.0:
-                        new_w = max(2, int(shot.width * scale))
-                        new_h = max(2, int(shot.height * scale))
+                    if SCREEN_CAPTURE_SCALE < 1.0:
+                        new_w = max(2, int(shot.width * SCREEN_CAPTURE_SCALE))
+                        new_h = max(2, int(shot.height * SCREEN_CAPTURE_SCALE))
                         from PyQt6.QtCore import Qt
                         qimg = qimg.scaled(
                             new_w, new_h,
@@ -172,11 +157,13 @@ class ScreenCaptureEngine(QObject):
                             Qt.TransformationMode.SmoothTransformation,
                         )
 
-                    jpeg_bytes = _encode_jpeg(qimg, quality)
+                    jpeg_bytes = _encode_jpeg(qimg, SCREEN_JPEG_QUALITY)
                     if jpeg_bytes is None:
-                        time.sleep(frame_interval)
-                        continue
+                        logger.error("QImage JPEG encoding failed")
+                        self.stop("Screen capture failed: could not encode JPEG frame")
+                        return
 
+                    self.frame_captured.emit(qimg)
                     self._enqueue_frame(jpeg_bytes, qimg.width(), qimg.height())
 
                     # Pace to the configured FPS.
@@ -184,16 +171,14 @@ class ScreenCaptureEngine(QObject):
                     sleep_for = frame_interval - elapsed
                     if sleep_for > 0:
                         time.sleep(sleep_for)
-        except Exception:
+        except BaseException as exc:
             logger.exception("Capture loop crashed")
-            self.stop("Capture loop crashed")
+            self.stop(f"Capture loop crashed: {exc}")
 
     def _enqueue_frame(self, jpeg_bytes: bytes, width: int, height: int) -> None:
         with self._queue_cond:
             while len(self._queue) >= SEND_QUEUE_MAX:
                 self._queue.popleft()
-                self._dropped_total += 1
-                self.frame_dropped.emit(self._dropped_total)
             self._seq += 1
             self._queue.append((self._seq, jpeg_bytes, width, height))
             self._queue_cond.notify()
@@ -224,8 +209,90 @@ class ScreenCaptureEngine(QObject):
                     "jpeg_b64": base64.b64encode(jpeg_bytes).decode("ascii"),
                 })
                 self.frame_sent.emit(seq)
-            except Exception:
+            except BaseException as exc:
                 logger.exception("Failed to send screen frame")
+                self.stop(f"Failed to send screen frame: {exc}")
+
+
+def _open_mss():
+    """Open an mss capture context, supporting both old and new mss APIs."""
+    try:
+        import mss
+        factory = getattr(mss, "MSS", None) or getattr(mss, "mss")
+        return factory()
+    except BaseException:
+        logger.error("Unable to initialize mss:\n%s", traceback.format_exc())
+        raise
+
+
+def _select_monitor(sct) -> tuple[dict, object]:
+    """Pick a monitor that produces usable pixels.
+
+    mss exposes monitor 0 as the "all monitors" composite and monitor 1+ as
+    physical displays. Some Linux display setups report a first physical
+    monitor that grabs as all black while the composite still contains the
+    real desktop, so preflight tries every candidate and prefers a non-blank
+    first frame.
+    """
+    monitors = getattr(sct, "monitors", None) or []
+    if not monitors:
+        raise RuntimeError("No monitors reported by screen capture backend")
+
+    if len(monitors) > 1:
+        candidates = list(monitors[1:]) + [monitors[0]]
+    else:
+        candidates = [monitors[0]]
+
+    first_success: tuple[dict, object] | None = None
+    first_error: BaseException | None = None
+    for monitor in candidates:
+        try:
+            shot = sct.grab(monitor)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            logger.warning("Screen grab failed for monitor %s: %s", monitor, exc)
+            continue
+        if first_success is None:
+            first_success = (monitor, shot)
+        if _looks_non_blank(shot):
+            return monitor, shot
+
+    if first_success is not None:
+        monitor, _shot = first_success
+        logger.warning(
+            "All screen capture candidates look blank; using monitor %s anyway",
+            monitor,
+        )
+        return first_success
+    if first_error is not None:
+        raise first_error
+    raise RuntimeError("No monitor could be captured")
+
+
+def _looks_non_blank(shot) -> bool:
+    """Return True when a captured frame has visible pixel variation."""
+    raw = getattr(shot, "rgb", None) or getattr(shot, "bgra", None) or getattr(shot, "raw", b"")
+    if not raw:
+        return False
+    sample = raw[:: max(1, len(raw) // 8192)]
+    return max(sample) - min(sample) > 2 and max(sample) > 8
+
+
+def _qimage_from_mss(shot) -> QImage:
+    """Convert an mss screenshot to a detached QImage using explicit RGB bytes."""
+    try:
+        rgb = shot.rgb
+    except BaseException:
+        logger.exception("Failed to read RGB bytes from mss frame")
+        raise
+    return QImage(
+        rgb,
+        shot.width,
+        shot.height,
+        shot.width * 3,
+        QImage.Format.Format_RGB888,
+    ).copy()
 
 
 def _encode_jpeg(qimage: QImage, quality: int) -> bytes | None:

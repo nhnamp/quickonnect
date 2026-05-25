@@ -5,8 +5,7 @@ Layout (top-to-bottom):
   - Frame view — a QLabel that holds the most recent decoded frame, scaled
     to fit while preserving aspect ratio. Receives input events when the
     local user has been granted remote control.
-  - Controls — Share / Stop / Request Control / Revoke buttons plus
-    runtime sliders for FPS and JPEG quality.
+  - Controls — Share / Stop / Request Control / Revoke buttons.
 
 The widget is purely a view: all network traffic happens through the
 ConnectionManager passed in at construction. All packet receipt is
@@ -19,7 +18,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QMessageBox,
+    QMessageBox,
 )
 
 from shared.constants import PacketType
@@ -38,6 +37,8 @@ class FrameLabel(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("background-color: #111; color: #888;")
         self.setText("No active screen share")
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._source: QImage | None = None
         self._draw_geom: tuple[int, int, int, int] | None = None  # ox,oy,w,h
 
@@ -94,7 +95,7 @@ class ScreenShareWidget(QWidget):
 
         self._engine = ScreenCaptureEngine(connection_manager, self)
         self._engine.stopped.connect(self._on_engine_stopped)
-        self._engine.frame_dropped.connect(self._on_frame_dropped)
+        self._engine.frame_captured.connect(self._on_local_frame_captured)
 
         self._executor = RemoteControlExecutor()
         self._remote_sender = RemoteControlSender(
@@ -105,7 +106,6 @@ class ScreenShareWidget(QWidget):
         )
 
         self._build_ui()
-        self._remote_sender.attach(self._frame_label)
         self._refresh_controls()
 
     # ------------------------------------------------------------------
@@ -139,46 +139,6 @@ class ScreenShareWidget(QWidget):
         btn_row.addWidget(self._request_btn)
         btn_row.addWidget(self._revoke_btn)
         layout.addLayout(btn_row)
-
-        # Controls row 2: quality + FPS sliders
-        tune_row = QHBoxLayout()
-        tune_row.addWidget(QLabel("FPS"))
-        self._fps_slider = QSlider(Qt.Orientation.Horizontal)
-        self._fps_slider.setRange(5, 30)
-        self._fps_slider.setValue(30)
-        self._fps_slider.setFixedWidth(120)
-        self._fps_slider.valueChanged.connect(self._on_fps_changed)
-        tune_row.addWidget(self._fps_slider)
-        self._fps_value = QLabel("30")
-        tune_row.addWidget(self._fps_value)
-
-        tune_row.addSpacing(24)
-        tune_row.addWidget(QLabel("JPEG quality"))
-        self._quality_slider = QSlider(Qt.Orientation.Horizontal)
-        self._quality_slider.setRange(30, 95)
-        self._quality_slider.setValue(70)
-        self._quality_slider.setFixedWidth(120)
-        self._quality_slider.valueChanged.connect(self._on_quality_changed)
-        tune_row.addWidget(self._quality_slider)
-        self._quality_value = QLabel("70")
-        tune_row.addWidget(self._quality_value)
-
-        tune_row.addSpacing(24)
-        tune_row.addWidget(QLabel("Scale"))
-        self._scale_slider = QSlider(Qt.Orientation.Horizontal)
-        self._scale_slider.setRange(25, 100)  # percent
-        self._scale_slider.setValue(100)
-        self._scale_slider.setFixedWidth(120)
-        self._scale_slider.valueChanged.connect(self._on_scale_changed)
-        tune_row.addWidget(self._scale_slider)
-        self._scale_value = QLabel("100%")
-        tune_row.addWidget(self._scale_value)
-        tune_row.addStretch()
-        layout.addLayout(tune_row)
-
-        self._diag_label = QLabel("")
-        self._diag_label.setStyleSheet("color: #888;")
-        layout.addWidget(self._diag_label)
 
     # ------------------------------------------------------------------
     # External entry points (called by main_window)
@@ -227,6 +187,7 @@ class ScreenShareWidget(QWidget):
         # capture engine down.
         if self._engine.is_running() and self._sharer_user_id == self._user_id:
             self._engine.stop("Stop received from server")
+        self._executor.stop()
         self._clear_share_state()
         self._frame_label.clear_frame()
         self._refresh_controls()
@@ -251,6 +212,18 @@ class ScreenShareWidget(QWidget):
             return
         # Only fire the dialog if WE are the sharer.
         if self._sharer_user_id != self._user_id:
+            return
+        if not self._executor.is_running():
+            QMessageBox.warning(
+                self,
+                "Remote Control",
+                "Remote control is not available on this machine.",
+            )
+            self.send_packet.emit(int(PacketType.REMOTE_GRANT), {
+                "room_code": self._room_code,
+                "granted": False,
+                "target_user_id": requester_user_id,
+            })
             return
         reply = QMessageBox.question(
             self,
@@ -277,35 +250,27 @@ class ScreenShareWidget(QWidget):
         if granted and target_user_id == self._user_id:
             self._controller_user_id = self._user_id
             self._controller_username = self._username
-            self._remote_sender.set_enabled(True)
+            self._enable_remote_input()
         elif not granted and self._controller_user_id == self._user_id:
             # We had control and just got revoked/denied.
-            self._remote_sender.set_enabled(False)
+            self._disable_remote_input()
             self._controller_user_id = None
             self._controller_username = ""
         else:
             self._controller_user_id = target_user_id if granted else None
             self._controller_username = target_username if granted else ""
 
-        # Local effect on the sharer (host) side: start/stop the executor.
-        if self._sharer_user_id == self._user_id:
-            if granted and target_user_id is not None:
-                ok, error = self._executor.start()
-                if not ok:
-                    QMessageBox.warning(
-                        self, "Remote control",
-                        error or "Could not start remote control on this machine.",
-                    )
-                    # Roll back the grant: tell the server we're not really
-                    # able to be controlled.
-                    self.send_packet.emit(int(PacketType.REMOTE_GRANT), {
-                        "room_code": self._room_code,
-                        "granted": False,
-                        "target_user_id": None,
-                    })
-                    return
-            else:
-                self._executor.stop()
+        if self._sharer_user_id == self._user_id and granted and not self._executor.is_running():
+            self.send_packet.emit(int(PacketType.REMOTE_GRANT), {
+                "room_code": self._room_code,
+                "granted": False,
+                "target_user_id": None,
+            })
+            QMessageBox.warning(
+                self, "Remote control",
+                "Remote control is not running on this machine.",
+            )
+            return
         self._refresh_controls()
 
     def on_remote_event(self, payload: dict) -> None:
@@ -328,6 +293,22 @@ class ScreenShareWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_share_clicked(self) -> None:
+        try:
+            self._start_screen_share()
+        except BaseException as exc:
+            logger.exception("Unexpected error while starting screen share")
+            self._engine.stop(f"Screen share startup failed: {exc}")
+            self._executor.stop()
+            self._clear_share_state()
+            self._frame_label.clear_frame()
+            self._refresh_controls()
+            QMessageBox.critical(
+                self,
+                "Screen Share",
+                f"Could not start screen sharing:\n{exc}",
+            )
+
+    def _start_screen_share(self) -> None:
         if not self._room_code:
             QMessageBox.information(self, "Screen Share",
                                     "Pick a room in the Chat tab first.")
@@ -338,8 +319,16 @@ class ScreenShareWidget(QWidget):
             return
         ok, error = self._engine.start(self._room_code)
         if not ok:
+            logger.error("Screen share startup failed: %s", error or "Could not start capture.")
             QMessageBox.warning(self, "Screen Share", error or "Could not start capture.")
             return
+        executor_ok, executor_error = self._executor.start()
+        if not executor_ok:
+            logger.warning("Remote control executor unavailable: %s", executor_error)
+            QMessageBox.warning(
+                self, "Remote Control",
+                executor_error or "Remote control is not available on this machine.",
+            )
         # Optimistically mark ourselves as the sharer; SCREEN_START broadcast
         # will confirm. If the server rejects (race against another sharer)
         # an ERROR comes back and main_window surfaces it.
@@ -391,26 +380,10 @@ class ScreenShareWidget(QWidget):
             # the sharer be the source of truth via their revoke button.
             # We toggle our local sender off; the server-side state will
             # be cleared next time the sharer revokes or share ends.
-            self._remote_sender.set_enabled(False)
+            self._disable_remote_input()
             self._controller_user_id = None
             self._controller_username = ""
             self._refresh_controls()
-
-    # ------------------------------------------------------------------
-    # Slider handlers
-    # ------------------------------------------------------------------
-
-    def _on_fps_changed(self, value: int) -> None:
-        self._fps_value.setText(str(value))
-        self._engine.set_fps(value)
-
-    def _on_quality_changed(self, value: int) -> None:
-        self._quality_value.setText(str(value))
-        self._engine.set_quality(value)
-
-    def _on_scale_changed(self, value: int) -> None:
-        self._scale_value.setText(f"{value}%")
-        self._engine.set_scale(value / 100.0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -429,7 +402,7 @@ class ScreenShareWidget(QWidget):
         self._sharer_username = ""
         self._controller_user_id = None
         self._controller_username = ""
-        self._remote_sender.set_enabled(False)
+        self._disable_remote_input()
 
     def _refresh_controls(self) -> None:
         in_room = self._room_code is not None
@@ -459,10 +432,32 @@ class ScreenShareWidget(QWidget):
             self._status_label.setText(f"Room {self._room_code}: {who} is sharing{ctrl}")
 
     def _on_engine_stopped(self, reason: str) -> None:
-        if reason and reason not in ("User stopped", "Stop received from server"):
-            self._diag_label.setText(f"Capture stopped: {reason}")
-        else:
-            self._diag_label.setText("")
+        normal_reasons = {
+            "User stopped",
+            "Stop received from server",
+            "Switched room",
+            "Shutdown",
+        }
+        if not reason or reason in normal_reasons:
+            return
 
-    def _on_frame_dropped(self, total: int) -> None:
-        self._diag_label.setText(f"Dropped frames (queue full): {total}")
+        logger.error("Screen sharing stopped unexpectedly: %s", reason)
+        if self._sharer_user_id == self._user_id:
+            self._send_screen_stop(self._room_code)
+        self._executor.stop()
+        self._clear_share_state()
+        self._frame_label.clear_frame()
+        self._refresh_controls()
+        QMessageBox.warning(self, "Screen Share", reason)
+
+    def _on_local_frame_captured(self, image: QImage) -> None:
+        if self._engine.is_running():
+            self._frame_label.set_frame(image)
+
+    def _enable_remote_input(self) -> None:
+        self._remote_sender.attach(self._frame_label)
+        self._remote_sender.set_enabled(True)
+        self._frame_label.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _disable_remote_input(self) -> None:
+        self._remote_sender.detach()

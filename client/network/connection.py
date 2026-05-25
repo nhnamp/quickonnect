@@ -27,6 +27,8 @@ class ConnectionManager:
     def __init__(self):
         self._sock: socket.socket | None = None
         self._aes_key: bytes | None = None
+        self._host: str | None = None
+        self._port: int | None = None
         self._send_lock = threading.Lock()
         self._receiver_thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
@@ -38,6 +40,12 @@ class ConnectionManager:
     @property
     def connected(self) -> bool:
         return self._running and self._sock is not None
+
+    @property
+    def server_address(self) -> tuple[str, int] | None:
+        if self._host is None or self._port is None:
+            return None
+        return self._host, self._port
 
     def connect(self, host: str, port: int) -> None:
         """Connect to a chat server and perform the RSA handshake."""
@@ -55,6 +63,8 @@ class ConnectionManager:
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
 
+        self._host = host
+        self._port = port
         logger.info("Connected to server %s:%d", host, port)
 
     def disconnect(self) -> None:
@@ -66,6 +76,8 @@ class ConnectionManager:
                 pass
             self._sock = None
         self._aes_key = None
+        self._host = None
+        self._port = None
 
     def send(self, packet_type: PacketType, payload: dict) -> None:
         """Thread-safe packet send."""

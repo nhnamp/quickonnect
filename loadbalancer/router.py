@@ -1,4 +1,5 @@
 import logging
+import ipaddress
 import socket
 import threading
 
@@ -44,7 +45,7 @@ class Router:
                     "code": 503, "message": "No available servers",
                 }, aes_key=None)
             else:
-                host = target.host if target.host != "0.0.0.0" else "127.0.0.1"
+                host = self._advertised_host(target.host, client_sock)
                 send_packet(client_sock, PacketType.CONNECT_RESPONSE, {
                     "server_ip": host,
                     "server_port": target.port,
@@ -85,6 +86,44 @@ class Router:
             self._set_room_server(room_code, target.server_id)
 
         return target
+
+    def _advertised_host(self, configured_host: str, client_sock: socket.socket) -> str:
+        """Return an address the requesting client can use to reach the chat server.
+
+        The load balancer may health-check local chat servers through 127.0.0.1,
+        but a second laptop cannot use that address because it points back to
+        itself. When a server host is loopback or wildcard, advertise the local
+        interface address that the client used to reach this LB connection.
+        """
+        if not self._is_local_only_host(configured_host):
+            return configured_host
+
+        try:
+            local_host = client_sock.getsockname()[0]
+        except OSError:
+            local_host = ""
+
+        if local_host and not self._is_unspecified_host(local_host):
+            return local_host
+        return "127.0.0.1"
+
+    @staticmethod
+    def _is_local_only_host(host: str) -> bool:
+        normalized = host.strip().lower()
+        if normalized == "localhost":
+            return True
+        try:
+            addr = ipaddress.ip_address(normalized)
+        except ValueError:
+            return False
+        return addr.is_loopback or addr.is_unspecified
+
+    @staticmethod
+    def _is_unspecified_host(host: str) -> bool:
+        try:
+            return ipaddress.ip_address(host.strip()).is_unspecified
+        except ValueError:
+            return False
 
     def _get_room_server(self, room_code: str) -> str | None:
         try:

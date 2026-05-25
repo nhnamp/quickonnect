@@ -1,20 +1,77 @@
 import logging
+from queue import Empty
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QMessageBox,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
 from shared.constants import PacketType
 from shared.protocol import Packet
 from client.network.connection import ConnectionManager
+from client.network.lb_client import request_server
 from client.storage.local_store import LocalStore
 from client.ui.chat_widget import ChatWidget
 from client.ui.friend_list_widget import FriendListWidget
 from client.ui.screen_share_widget import ScreenShareWidget
 
 logger = logging.getLogger(__name__)
+
+
+class _JoinRoomWorker(QThread):
+    """Reconnect through the load balancer before joining a regular room."""
+
+    finished = pyqtSignal(bool, str)  # success, error
+
+    def __init__(
+        self,
+        lb_host: str,
+        lb_port: int,
+        conn_mgr: ConnectionManager,
+        token: str,
+        room_code: str,
+    ):
+        super().__init__()
+        self._lb_host = lb_host
+        self._lb_port = lb_port
+        self._conn = conn_mgr
+        self._token = token
+        self._room_code = room_code
+
+    def run(self):
+        try:
+            host, port = request_server(self._lb_host, self._lb_port, self._room_code)
+            if self._conn.connected and self._conn.server_address == (host, port):
+                self._conn.send(PacketType.JOIN_ROOM, {"room_code": self._room_code})
+                self.finished.emit(True, "")
+                return
+
+            self._conn.disconnect()
+            self._drain_packet_queue()
+            self._conn.connect(host, port)
+            self._conn.send(PacketType.AUTH_REQUEST, {"token": self._token})
+
+            packet = self._conn.packet_queue.get(timeout=15)
+            if packet.packet_type == PacketType.AUTH_RESPONSE and packet.payload.get("success"):
+                self._conn.send(PacketType.JOIN_ROOM, {"room_code": self._room_code})
+                self.finished.emit(True, "")
+            elif packet.packet_type == PacketType.ERROR:
+                self._conn.disconnect()
+                self.finished.emit(False, packet.payload.get("message", "Server error"))
+            else:
+                self._conn.disconnect()
+                self.finished.emit(False, packet.payload.get("error", "Authentication failed"))
+        except Exception as exc:
+            self._conn.disconnect()
+            self.finished.emit(False, str(exc))
+
+    def _drain_packet_queue(self):
+        while True:
+            try:
+                self._conn.packet_queue.get_nowait()
+            except Empty:
+                return
 
 
 class MainWindow(QMainWindow):
@@ -26,6 +83,13 @@ class MainWindow(QMainWindow):
         self._store = local_store
         self._user_id = user_info.get("user_id", 0)
         self._username = user_info.get("username", "")
+        self._token = user_info.get("token", "")
+        if not self._token:
+            session = self._store.load_session() or {}
+            self._token = session.get("token", "")
+        self._lb_host = user_info.get("lb_host", "127.0.0.1")
+        self._lb_port = int(user_info.get("lb_port", 9000))
+        self._join_worker: _JoinRoomWorker | None = None
 
         self.setWindowTitle(f"QuicKonNect - {self._username}")
         self.setMinimumSize(800, 600)
@@ -99,6 +163,7 @@ class MainWindow(QMainWindow):
 
         self._chat_widget = ChatWidget()
         self._chat_widget.send_packet.connect(self._send_packet)
+        self._chat_widget.join_room_requested.connect(self._on_join_room_requested)
 
         self._friend_widget = FriendListWidget()
         self._friend_widget.send_packet.connect(self._send_packet)
@@ -212,6 +277,38 @@ class MainWindow(QMainWindow):
         room_code = f"DM-{names[0]}-{names[1]}"
         self._conn.send(PacketType.JOIN_ROOM, {"room_code": room_code})
         self._stack.setCurrentIndex(0)
+
+    def _on_join_room_requested(self, room_code: str):
+        if not room_code:
+            return
+        if room_code.startswith("DM-"):
+            self._conn.send(PacketType.JOIN_ROOM, {"room_code": room_code})
+            return
+        if not self._token:
+            self.statusBar().showMessage("Cannot rejoin through load balancer: missing session token", 5000)
+            return
+        if self._join_worker and self._join_worker.isRunning():
+            self.statusBar().showMessage("Already joining a room...", 3000)
+            return
+
+        self.statusBar().showMessage(f"Routing to room {room_code}...")
+        self._poll_timer.stop()
+        self._join_worker = _JoinRoomWorker(
+            self._lb_host,
+            self._lb_port,
+            self._conn,
+            self._token,
+            room_code,
+        )
+        self._join_worker.finished.connect(self._on_join_room_finished)
+        self._join_worker.start()
+
+    def _on_join_room_finished(self, success: bool, error: str):
+        self._poll_timer.start(16)
+        if success:
+            self.statusBar().showMessage("Joined room", 3000)
+        else:
+            QMessageBox.warning(self, "Join Room Failed", error or "Unable to join room")
 
     def _on_logout(self):
         self._poll_timer.stop()
