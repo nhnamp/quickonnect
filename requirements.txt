@@ -14,5 +14,10 @@ PyQt6>=6.6.0
 mss>=9.0.0
 pyautogui>=0.9.54
 
+# Phase 3: audio streaming & optional subtitles
+PyAudio>=0.2.14
+faster-whisper>=1.0.0
+deep-translator>=1.11.4
+
 # Development / Testing
 pytest>=8.0.0

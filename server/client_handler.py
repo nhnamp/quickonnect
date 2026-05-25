@@ -6,6 +6,8 @@ import time
 
 from shared.constants import PacketType, HEARTBEAT_TIMEOUT
 from shared.protocol import read_packet, send_packet, Packet
+from shared.attachments import ALLOWED_MESSAGE_TYPES, validate_attachment_content
+from server.features.audio_mixer import AudioFrame
 from shared.crypto import (
     generate_rsa_keypair,
     serialize_public_key,
@@ -216,6 +218,9 @@ class ClientHandler(threading.Thread):
             PacketType.REMOTE_REQUEST: self._handle_remote_request,
             PacketType.REMOTE_GRANT: self._handle_remote_grant,
             PacketType.REMOTE_EVENT: self._handle_remote_event,
+            PacketType.AUDIO_CHUNK: self._handle_audio_chunk,
+            PacketType.DRAW_EVENT: self._handle_draw_event,
+            PacketType.EXPORT_REQUEST: self._handle_whiteboard_export,
         }
         handler = handlers.get(packet.packet_type)
         if handler:
@@ -284,8 +289,13 @@ class ClientHandler(threading.Thread):
         history = self._server.message_service.get_history(state.room_id)
         self.send(PacketType.MESSAGE_HISTORY, {
             "room_id": state.room_id,
+            "room_code": room_code,
             "messages": [m.to_dict() for m in history],
         })
+
+        whiteboard = room_manager.get_whiteboard_state(room_code)
+        if whiteboard is not None:
+            self.send(PacketType.WHITEBOARD_SYNC, whiteboard.sync_payload())
 
         clients = room_manager.get_room_clients(room_code)
         for uid, handler in clients.items():
@@ -352,6 +362,17 @@ class ClientHandler(threading.Thread):
 
         if not room_code or not content:
             return
+        if msg_type not in ALLOWED_MESSAGE_TYPES:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Unsupported message type"})
+            return
+        if msg_type == "text" and len(str(content)) > 8000:
+            self.send(PacketType.ERROR, {"code": 413, "message": "Text message is too long"})
+            return
+        if msg_type in {"image", "file"}:
+            valid, error = validate_attachment_content(str(content), msg_type)
+            if not valid:
+                self.send(PacketType.ERROR, {"code": 400, "message": error or "Invalid attachment"})
+                return
 
         is_dm = room_code.startswith("DM-")
 
@@ -606,6 +627,92 @@ class ClientHandler(threading.Thread):
         forward = dict(packet.payload)
         forward["controller_user_id"] = self.user_id
         sharer.send(PacketType.REMOTE_EVENT, forward)
+
+    # ------------------------------------------------------------------
+    # Audio streaming
+    # ------------------------------------------------------------------
+
+    def _handle_audio_chunk(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        audio = self._server.room_manager.get_audio_state(room_code)
+        if audio is None:
+            return
+
+        if bool(packet.payload.get("muted", False)):
+            audio.set_speaking(self.user_id, False)
+            return
+        audio.set_speaking(self.user_id, True)
+
+        pcm_b64 = packet.payload.get("pcm_b64", "")
+        if not pcm_b64:
+            return
+        try:
+            pcm = base64.b64decode(pcm_b64)
+        except Exception:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Invalid audio payload"})
+            return
+
+        audio.add_chunk(AudioFrame(
+            user_id=self.user_id,
+            username=self.username or "",
+            seq=int(packet.payload.get("seq", 0)),
+            timestamp_ms=int(packet.payload.get("timestamp_ms", 0)),
+            pcm=pcm,
+        ))
+
+    # ------------------------------------------------------------------
+    # Whiteboard
+    # ------------------------------------------------------------------
+
+    def _resolve_whiteboard_room(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Room code required"})
+            return None, None
+        if room_code not in self._current_rooms:
+            self.send(PacketType.ERROR, {"code": 403, "message": "Not in this room"})
+            return None, None
+        whiteboard = self._server.room_manager.get_whiteboard_state(room_code)
+        if whiteboard is None:
+            self.send(PacketType.ERROR, {"code": 404, "message": "Room not found"})
+            return None, None
+        return room_code, whiteboard
+
+    def _handle_draw_event(self, packet: Packet):
+        room_code, whiteboard = self._resolve_whiteboard_room(packet)
+        if room_code is None:
+            return
+        event, error = whiteboard.add_event(
+            user_id=self.user_id,
+            username=self.username or "",
+            event_type=packet.payload.get("event_type", ""),
+            payload=packet.payload.get("payload", {}),
+        )
+        if error or event is None:
+            self.send(PacketType.ERROR, {"code": 400, "message": error or "Invalid whiteboard event"})
+            return
+
+        event_payload = event.to_dict()
+        for handler in self._server.room_manager.get_room_clients(room_code).values():
+            handler.send(PacketType.DRAW_BROADCAST, event_payload)
+        self.send(PacketType.DRAW_ACK, {
+            "room_code": room_code,
+            "client_seq_num": packet.payload.get("client_seq_num", 0),
+            "seq_num": event.seq_num,
+        })
+
+    def _handle_whiteboard_export(self, packet: Packet):
+        room_code, whiteboard = self._resolve_whiteboard_room(packet)
+        if room_code is None:
+            return
+        self.send(PacketType.FILE_TRANSFER, {
+            "room_code": room_code,
+            "filename": f"whiteboard-{room_code}.json",
+            "mime_type": "application/json",
+            "content": whiteboard.sync_payload(),
+        })
 
     # ------------------------------------------------------------------
     # Friends

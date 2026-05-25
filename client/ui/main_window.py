@@ -1,4 +1,5 @@
 import logging
+from queue import Empty
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,6 +14,8 @@ from client.storage.local_store import LocalStore
 from client.ui.chat_widget import ChatWidget
 from client.ui.friend_list_widget import FriendListWidget
 from client.ui.screen_share_widget import ScreenShareWidget
+from client.ui.audio_widget import AudioWidget
+from client.ui.whiteboard_widget import WhiteboardWidget
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,7 @@ class MainWindow(QMainWindow):
         self._store = local_store
         self._user_id = user_info.get("user_id", 0)
         self._username = user_info.get("username", "")
+        self._redirecting = False
 
         self.setWindowTitle(f"QuicKonNect - {self._username}")
         self.setMinimumSize(800, 600)
@@ -77,7 +81,9 @@ class MainWindow(QMainWindow):
         self._chat_btn = QPushButton("Chat")
         self._friends_btn = QPushButton("Friends")
         self._screen_btn = QPushButton("Screen")
-        for btn in [self._chat_btn, self._friends_btn, self._screen_btn]:
+        self._audio_btn = QPushButton("Audio")
+        self._whiteboard_btn = QPushButton("Whiteboard")
+        for btn in [self._chat_btn, self._friends_btn, self._screen_btn, self._audio_btn, self._whiteboard_btn]:
             btn.setStyleSheet(
                 "QPushButton { color: white; background: #2c3e50; padding: 8px; border: none; }"
                 "QPushButton:hover { background: #1abc9c; }"
@@ -86,10 +92,14 @@ class MainWindow(QMainWindow):
         self._chat_btn.clicked.connect(lambda: self._stack.setCurrentIndex(0))
         self._friends_btn.clicked.connect(lambda: self._stack.setCurrentIndex(1))
         self._screen_btn.clicked.connect(lambda: self._stack.setCurrentIndex(2))
+        self._audio_btn.clicked.connect(lambda: self._stack.setCurrentIndex(3))
+        self._whiteboard_btn.clicked.connect(lambda: self._stack.setCurrentIndex(4))
 
         sidebar_layout.addWidget(self._chat_btn)
         sidebar_layout.addWidget(self._friends_btn)
         sidebar_layout.addWidget(self._screen_btn)
+        sidebar_layout.addWidget(self._audio_btn)
+        sidebar_layout.addWidget(self._whiteboard_btn)
         sidebar_layout.addStretch()
 
         body_layout.addWidget(sidebar)
@@ -108,9 +118,19 @@ class MainWindow(QMainWindow):
         self._screen_widget.send_packet.connect(self._send_packet)
         self._chat_widget.room_changed.connect(self._screen_widget.set_current_room)
 
+        self._audio_widget = AudioWidget(self._conn, self._user_id, self._username)
+        self._audio_widget.send_packet.connect(self._send_packet)
+        self._chat_widget.room_changed.connect(self._audio_widget.set_current_room)
+
+        self._whiteboard_widget = WhiteboardWidget(self._user_id)
+        self._whiteboard_widget.send_packet.connect(self._send_packet)
+        self._chat_widget.room_changed.connect(self._whiteboard_widget.set_current_room)
+
         self._stack.addWidget(self._chat_widget)
         self._stack.addWidget(self._friend_widget)
         self._stack.addWidget(self._screen_widget)
+        self._stack.addWidget(self._audio_widget)
+        self._stack.addWidget(self._whiteboard_widget)
 
         body_layout.addWidget(self._stack)
         main_layout.addWidget(body)
@@ -144,6 +164,8 @@ class MainWindow(QMainWindow):
             # Phase 2: surface any active share that already exists in the room.
             self._screen_widget.set_current_room(room_code)
             self._screen_widget.handle_room_state_screen(data.get("screen"))
+            self._audio_widget.set_current_room(room_code)
+            self._whiteboard_widget.set_current_room(room_code)
 
         elif ptype == PacketType.MESSAGE_HISTORY:
             room_id = data.get("room_id", 0)
@@ -151,7 +173,7 @@ class MainWindow(QMainWindow):
             room_code = data.get("room_code", "")
             if room_code:
                 self._chat_widget.add_room(room_code, room_id)
-            self._chat_widget.load_history(room_id, messages)
+            self._chat_widget.load_history(room_id, messages, room_code)
 
         elif ptype == PacketType.CHAT_MESSAGE:
             self._chat_widget.add_message(data)
@@ -184,12 +206,26 @@ class MainWindow(QMainWindow):
         elif ptype == PacketType.REMOTE_EVENT:
             self._screen_widget.on_remote_event(data)
 
+        elif ptype == PacketType.MIXED_AUDIO:
+            self._audio_widget.on_mixed_audio(data)
+
+        elif ptype == PacketType.SUBTITLE:
+            self._audio_widget.on_subtitle(data)
+
+        elif ptype == PacketType.WHITEBOARD_SYNC:
+            self._whiteboard_widget.on_sync(data)
+
+        elif ptype == PacketType.DRAW_BROADCAST:
+            self._whiteboard_widget.on_draw_broadcast(data)
+
+        elif ptype == PacketType.FILE_TRANSFER:
+            self._whiteboard_widget.on_file_transfer(data)
+
         elif ptype == PacketType.ERROR:
             code = data.get("code", 0)
             msg = data.get("message", "Unknown error")
             if code == 307:
-                QMessageBox.information(self, "Redirect",
-                    f"Room is on another server. Please rejoin with the room code.")
+                self._handle_room_redirect(data)
             else:
                 self.statusBar().showMessage(f"Error: {msg}", 5000)
 
@@ -213,20 +249,66 @@ class MainWindow(QMainWindow):
         self._conn.send(PacketType.JOIN_ROOM, {"room_code": room_code})
         self._stack.setCurrentIndex(0)
 
+    def _handle_room_redirect(self, data: dict):
+        host = data.get("redirect_host", "")
+        port = int(data.get("redirect_port", 0))
+        room_code = data.get("room_code", "")
+        if not host or not port or not room_code:
+            QMessageBox.information(self, "Redirect", "Room is on another server. Please rejoin.")
+            return
+
+        session = self._store.load_session() or {}
+        token = session.get("token", "")
+        if not token:
+            QMessageBox.warning(self, "Redirect", "Please log in again before joining this room.")
+            return
+
+        self.statusBar().showMessage(f"Reconnecting to room server for {room_code}...", 5000)
+        self._redirecting = True
+        self._poll_timer.stop()
+        self._screen_widget.shutdown()
+        self._audio_widget.shutdown()
+        self._conn.disconnect()
+
+        while not self._conn.packet_queue.empty():
+            try:
+                self._conn.packet_queue.get_nowait()
+            except Empty:
+                break
+
+        try:
+            self._conn.connect(host, port)
+            self._conn.send(PacketType.AUTH_REQUEST, {"token": token})
+            packet = self._conn.packet_queue.get(timeout=15)
+            if packet.packet_type != PacketType.AUTH_RESPONSE or not packet.payload.get("success"):
+                raise ConnectionError(packet.payload.get("error", "Authentication failed after redirect"))
+            self._conn.send(PacketType.JOIN_ROOM, {"room_code": room_code})
+            self._conn.on_disconnected = self._on_disconnected
+        except Exception as exc:
+            self._conn.disconnect()
+            QMessageBox.warning(self, "Redirect failed", str(exc))
+        finally:
+            self._redirecting = False
+            self._poll_timer.start(16)
+
     def _on_logout(self):
         self._poll_timer.stop()
         self._screen_widget.shutdown()
+        self._audio_widget.shutdown()
         self._store.clear_session()
         self._conn.disconnect()
         self.logout_requested.emit()
         self.close()
 
     def _on_disconnected(self, reason: str):
+        if self._redirecting:
+            return
         QTimer.singleShot(0, lambda: self._show_disconnect(reason))
 
     def _show_disconnect(self, reason: str):
         self._poll_timer.stop()
         self._screen_widget.shutdown()
+        self._audio_widget.shutdown()
         QMessageBox.warning(self, "Disconnected", f"Lost connection: {reason}")
         self.logout_requested.emit()
         self.close()
@@ -234,6 +316,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._poll_timer.stop()
         self._screen_widget.shutdown()
+        self._audio_widget.shutdown()
         if self._conn.connected:
             self._conn.disconnect()
         event.accept()
