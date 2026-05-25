@@ -10,6 +10,7 @@ import psycopg
 
 SCHEMA_SQL = """
 -- Drop existing types and tables for clean setup
+DROP TABLE IF EXISTS whiteboard_snapshots CASCADE;
 DROP TABLE IF EXISTS whiteboard_events CASCADE;
 DROP TABLE IF EXISTS messages CASCADE;
 DROP TABLE IF EXISTS room_participants CASCADE;
@@ -91,6 +92,14 @@ CREATE TABLE whiteboard_events (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_whiteboard_room_seq ON whiteboard_events(room_id, seq_num);
+
+-- Whiteboard snapshots (for Phase 4 periodic snapshots)
+CREATE TABLE whiteboard_snapshots (
+    room_id       INT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+    last_seq      INT NOT NULL,
+    snapshot_png  BYTEA NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 

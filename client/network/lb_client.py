@@ -33,6 +33,12 @@ def request_server(lb_host: str, lb_port: int, room_code: str | None = None) -> 
 
         host = response.payload["server_ip"]
         port = response.payload["server_port"]
+        
+        # If the server is bound to all interfaces or localhost, 
+        # replace it with the LB's host so remote clients know where to connect.
+        if host in ("0.0.0.0", "127.0.0.1", "localhost", "::", ""):
+            host = lb_host
+
         logger.info("LB assigned server %s:%d (room=%s)", host, port, room_code or "none")
         return host, port
 

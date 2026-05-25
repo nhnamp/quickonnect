@@ -37,6 +37,7 @@ class ClientHandler(threading.Thread):
         self._authenticated = False
         self._current_rooms: set[str] = set()
         self._last_heartbeat = time.time()
+        self._e2e_public_key: str = ""  # Base64-encoded E2E public key
 
     def run(self):
         self._running = True
@@ -216,6 +217,12 @@ class ClientHandler(threading.Thread):
             PacketType.REMOTE_REQUEST: self._handle_remote_request,
             PacketType.REMOTE_GRANT: self._handle_remote_grant,
             PacketType.REMOTE_EVENT: self._handle_remote_event,
+            PacketType.AUDIO_CHUNK: self._handle_audio_chunk,
+            PacketType.DRAW_EVENT: self._handle_draw_event,
+            PacketType.EXPORT_REQUEST: self._handle_export_request,
+            PacketType.ROOM_INVITE: self._handle_room_invite,
+            PacketType.PUBLIC_KEY_ANNOUNCE: self._handle_public_key_announce,
+            PacketType.PUBLIC_KEY_REQUEST: self._handle_public_key_request,
         }
         handler = handlers.get(packet.packet_type)
         if handler:
@@ -287,6 +294,14 @@ class ClientHandler(threading.Thread):
             "messages": [m.to_dict() for m in history],
         })
 
+        wb = room_manager.get_whiteboard_state(room_code)
+        if wb is not None:
+            self.send(PacketType.WHITEBOARD_SYNC, {
+                "room_code": room_code,
+                "snapshot": wb.get_snapshot_b64(),
+                "events": wb.get_active_events(),
+            })
+
         clients = room_manager.get_room_clients(room_code)
         for uid, handler in clients.items():
             if uid != self.user_id:
@@ -353,6 +368,17 @@ class ClientHandler(threading.Thread):
         if not room_code or not content:
             return
 
+        # Validate msg_type
+        if msg_type not in ("text", "image", "file"):
+            self.send(PacketType.ERROR, {"code": 400, "message": "Invalid message type"})
+            return
+
+        # File/image size validation (base64 content ~= 4/3 * raw size)
+        _MAX_CONTENT_LEN = 14 * 1024 * 1024  # ~10 MB after base64 decoding
+        if msg_type in ("image", "file") and len(content) > _MAX_CONTENT_LEN:
+            self.send(PacketType.ERROR, {"code": 413, "message": "File too large (max 10 MB)"})
+            return
+
         is_dm = room_code.startswith("DM-")
 
         if is_dm:
@@ -400,6 +426,10 @@ class ClientHandler(threading.Thread):
         msg.sender_name = self.username
         msg_data = msg.to_dict()
         msg_data["room_code"] = room_code
+        # Pass through file metadata
+        if msg_type in ("image", "file"):
+            msg_data["filename"] = packet.payload.get("filename", "")
+            msg_data["filesize"] = packet.payload.get("filesize", 0)
 
         clients = self._server.room_manager.get_room_clients(room_code)
         for uid, handler in clients.items():
@@ -606,6 +636,155 @@ class ClientHandler(threading.Thread):
         forward = dict(packet.payload)
         forward["controller_user_id"] = self.user_id
         sharer.send(PacketType.REMOTE_EVENT, forward)
+
+    # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+
+    def _handle_audio_chunk(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        mixer = self._server.room_manager.get_audio_mixer(room_code)
+        if mixer is None:
+            return
+        # Lazily register this user as an audio participant
+        mixer.add_participant(self.user_id, self.username)
+        pcm_b64 = packet.payload.get("pcm_b64", "")
+        seq = packet.payload.get("seq", 0)
+        if pcm_b64:
+            mixer.feed_audio(self.user_id, pcm_b64, seq)
+
+    # ------------------------------------------------------------------
+    # Whiteboard
+    # ------------------------------------------------------------------
+
+    def _handle_draw_event(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        wb = self._server.room_manager.get_whiteboard_state(room_code)
+        if wb is None:
+            return
+        
+        event_type = packet.payload.get("event_type")
+        payload = packet.payload.get("payload")
+        client_event_id = packet.payload.get("client_event_id")
+
+        if not event_type or not isinstance(payload, dict):
+            return
+
+        seq = wb.add_event(self.user_id, event_type, payload, client_event_id)
+
+        # Send ACK to the sender
+        self.send(PacketType.DRAW_ACK, {
+            "room_code": room_code,
+            "client_event_id": client_event_id,
+            "seq_num": seq,
+        })
+
+        # Broadcast to all clients in the room
+        self._broadcast_to_room(room_code, PacketType.DRAW_BROADCAST, {
+            "room_code": room_code,
+            "seq_num": seq,
+            "user_id": self.user_id,
+            "username": self.username,
+            "event_type": event_type,
+            "payload": payload,
+            "client_event_id": client_event_id,
+        })
+
+    def _handle_export_request(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        wb = self._server.room_manager.get_whiteboard_state(room_code)
+        if wb is None:
+            return
+
+        try:
+            png_bytes = wb.render_png()
+            png_b64 = base64.b64encode(png_bytes).decode("ascii")
+            self.send(PacketType.FILE_TRANSFER, {
+                "room_code": room_code,
+                "file_type": "whiteboard_export",
+                "file_data": png_b64,
+                "file_name": f"whiteboard_{room_code}.png",
+            })
+        except Exception:
+            logger.exception("Failed to render and export whiteboard to PNG")
+            self.send(PacketType.ERROR, {"code": 500, "message": "Failed to render whiteboard"})
+
+    # ------------------------------------------------------------------
+    # Room invites
+    # ------------------------------------------------------------------
+
+    def _handle_room_invite(self, packet: Packet):
+        """Forward a room invite to the target user."""
+        target_username = packet.payload.get("target_username", "").strip()
+        room_code = packet.payload.get("room_code", "").strip()
+        if not target_username or not room_code:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Invalid invite"})
+            return
+
+        # Look up locally first
+        target = self._server.get_client_by_username(target_username)
+        if target is not None:
+            target.send(PacketType.ROOM_INVITE_NOTIFY, {
+                "room_code": room_code,
+                "from_user_id": self.user_id,
+                "from_username": self.username,
+            })
+        else:
+            # Try cross-server via Redis
+            try:
+                import json
+                self._server._redis.publish("room_invites", json.dumps({
+                    "target_username": target_username,
+                    "room_code": room_code,
+                    "from_user_id": self.user_id,
+                    "from_username": self.username,
+                    "originating_server_id": self._server.config.server_id,
+                }))
+            except Exception:
+                logger.debug("Failed to publish room invite")
+
+        self.send(PacketType.ROOM_UPDATE, {
+            "room_code": room_code,
+            "event": "invite_sent",
+            "username": target_username,
+        })
+
+    # ------------------------------------------------------------------
+    # E2E Public Key Exchange
+    # ------------------------------------------------------------------
+
+    def _handle_public_key_announce(self, packet: Packet):
+        """Store the client's E2E public key for key exchange."""
+        self._e2e_public_key = packet.payload.get("public_key", "")
+        logger.debug("Stored E2E public key for user %s", self.username)
+
+    def _handle_public_key_request(self, packet: Packet):
+        """Look up a user's E2E public key and respond."""
+        target_username = packet.payload.get("target_username", "").strip()
+        if not target_username:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Username required"})
+            return
+
+        target = self._server.get_client_by_username(target_username)
+        if target is None or not target._e2e_public_key:
+            self.send(PacketType.PUBLIC_KEY_RESPONSE, {
+                "username": target_username,
+                "public_key": "",
+                "found": False,
+            })
+            return
+
+        self.send(PacketType.PUBLIC_KEY_RESPONSE, {
+            "username": target_username,
+            "public_key": target._e2e_public_key,
+            "found": True,
+        })
 
     # ------------------------------------------------------------------
     # Friends

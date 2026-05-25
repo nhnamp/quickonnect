@@ -44,7 +44,18 @@ class Router:
                     "code": 503, "message": "No available servers",
                 }, aes_key=None)
             else:
-                host = target.host if target.host != "0.0.0.0" else "127.0.0.1"
+                host = target.host
+                if host in ("0.0.0.0", "127.0.0.1", "localhost", "::", ""):
+                    import os
+                    announce_ip = os.environ.get("LB_ANNOUNCE_IP")
+                    if announce_ip:
+                        host = announce_ip
+                    else:
+                        try:
+                            host = client_sock.getsockname()[0]
+                        except Exception:
+                            host = "127.0.0.1"
+
                 send_packet(client_sock, PacketType.CONNECT_RESPONSE, {
                     "server_ip": host,
                     "server_port": target.port,

@@ -16,15 +16,20 @@ pushed in from main_window via the on_packet() entry points.
 import logging
 
 from PyQt6.QtCore import Qt, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor
+import base64
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QMessageBox,
+    QSlider, QMessageBox, QStackedWidget, QFileDialog,
 )
 
 from shared.constants import PacketType
 from client.features.screen_engine import ScreenCaptureEngine, decode_jpeg
 from client.features.remote_control import RemoteControlSender, RemoteControlExecutor
+from client.features.audio_engine import AudioEngine
+from client.features.whiteboard_engine import WhiteboardEngine
+from client.ui.subtitle_widget import SubtitleWidget
+from client.ui.whiteboard_widget import WhiteboardWidget
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,14 @@ class FrameLabel(QLabel):
 
     def resizeEvent(self, event):  # noqa: N802
         self._refresh_pixmap()
+        # Reposition subtitle overlay (if present as child widget)
+        for child in self.children():
+            if hasattr(child, 'show_subtitle'):  # duck-type check for SubtitleWidget
+                cw = child.width()
+                ch = child.sizeHint().height()
+                x = (self.width() - cw) // 2
+                y = self.height() - ch - 12
+                child.move(max(0, x), max(0, y))
         super().resizeEvent(event)
 
     def _refresh_pixmap(self) -> None:
@@ -104,6 +117,9 @@ class ScreenShareWidget(QWidget):
             self,
         )
 
+        self._audio_engine = AudioEngine(connection_manager)
+        self._whiteboard_engine = WhiteboardEngine(connection_manager, username)
+
         self._build_ui()
         self._remote_sender.attach(self._frame_label)
         self._refresh_controls()
@@ -120,21 +136,45 @@ class ScreenShareWidget(QWidget):
         self._status_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._status_label)
 
+        # Stacked view containing Screen Frame and Whiteboard
+        self._stacked_view = QStackedWidget(self)
         self._frame_label = FrameLabel(self)
-        layout.addWidget(self._frame_label, stretch=1)
+        self._whiteboard_widget = WhiteboardWidget(self)
+        self._whiteboard_widget.draw_created.connect(self._on_local_draw)
+        self._whiteboard_widget.export_requested.connect(self._on_local_export)
 
-        # Controls row 1: share / stop / request control / revoke
+        self._stacked_view.addWidget(self._frame_label)
+        self._stacked_view.addWidget(self._whiteboard_widget)
+        layout.addWidget(self._stacked_view, stretch=1)
+
+        # Controls row 1: share / stop / request control / revoke + audio mute
         btn_row = QHBoxLayout()
         self._share_btn = QPushButton("Share Screen")
         self._share_btn.clicked.connect(self._on_share_clicked)
         self._stop_btn = QPushButton("Stop Sharing")
         self._stop_btn.clicked.connect(self._on_stop_clicked)
+        
+        self._whiteboard_btn = QPushButton("🎨 Whiteboard")
+        self._whiteboard_btn.setCheckable(True)
+        self._whiteboard_btn.clicked.connect(self._on_whiteboard_toggled)
+
         self._request_btn = QPushButton("Request Control")
         self._request_btn.clicked.connect(self._on_request_clicked)
         self._revoke_btn = QPushButton("Revoke Control")
         self._revoke_btn.clicked.connect(self._on_revoke_clicked)
+
+        self._mute_btn = QPushButton("\U0001F3A4 Mute")
+        self._mute_btn.setCheckable(True)
+        self._mute_btn.setStyleSheet(
+            "QPushButton { padding: 4px 12px; }"
+            "QPushButton:checked { background-color: #c0392b; color: white; }"
+        )
+        self._mute_btn.clicked.connect(self._on_mute_toggled)
+
         btn_row.addWidget(self._share_btn)
         btn_row.addWidget(self._stop_btn)
+        btn_row.addWidget(self._whiteboard_btn)
+        btn_row.addWidget(self._mute_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._request_btn)
         btn_row.addWidget(self._revoke_btn)
@@ -180,6 +220,11 @@ class ScreenShareWidget(QWidget):
         self._diag_label.setStyleSheet("color: #888;")
         layout.addWidget(self._diag_label)
 
+        # Subtitle overlay (positioned manually on top of the stacked view)
+        self._subtitle_widget = SubtitleWidget(self._stacked_view)
+        self._subtitle_widget.setFixedWidth(600)
+        self._subtitle_widget.hide()
+
     # ------------------------------------------------------------------
     # External entry points (called by main_window)
     # ------------------------------------------------------------------
@@ -193,9 +238,19 @@ class ScreenShareWidget(QWidget):
         if self._engine.is_running():
             self._engine.stop("Switched room")
             self._send_screen_stop(self._room_code)
+        # Stop audio in the old room
+        self._audio_engine.stop()
+        self._whiteboard_widget.clear_all()
+        self._whiteboard_btn.setChecked(False)
+        self._stacked_view.setCurrentIndex(0)
         self._room_code = room_code
         self._clear_share_state()
         self._refresh_controls()
+        # Start audio in the new room (if we have one)
+        if room_code:
+            ok, error = self._audio_engine.start(room_code)
+            if not ok:
+                logger.warning("Audio engine failed to start: %s", error)
 
     def handle_room_state_screen(self, screen_info: dict | None) -> None:
         """Apply any active share carried by a ROOM_STATE payload."""
@@ -316,12 +371,34 @@ class ScreenShareWidget(QWidget):
             return
         self._executor.submit(payload)
 
+    def on_mixed_audio(self, payload: dict) -> None:
+        """Handle incoming MIXED_AUDIO packet — feed to playback."""
+        if payload.get("room_code") != self._room_code:
+            return
+        pcm_b64 = payload.get("pcm_b64", "")
+        if pcm_b64:
+            self._audio_engine.feed_playback(pcm_b64)
+
+    def on_subtitle(self, payload: dict) -> None:
+        """Handle incoming SUBTITLE packet — show subtitle overlay."""
+        if payload.get("room_code") != self._room_code:
+            return
+        speaker = payload.get("speaker_username", "")
+        text = payload.get("text", "")
+        translated = payload.get("translated_text", "")
+        if text:
+            self._subtitle_widget.show_subtitle(speaker, text, translated)
+            self._position_subtitle()
+
     def shutdown(self) -> None:
         """Called on logout / disconnect — stop any local threads."""
         if self._engine.is_running():
             self._engine.stop("Shutdown")
+        self._audio_engine.stop()
         self._executor.stop()
         self._remote_sender.detach()
+        self._subtitle_widget.clear()
+        self._whiteboard_widget.clear_all()
 
     # ------------------------------------------------------------------
     # Button handlers
@@ -396,6 +473,11 @@ class ScreenShareWidget(QWidget):
             self._controller_username = ""
             self._refresh_controls()
 
+    def _on_mute_toggled(self) -> None:
+        muted = self._mute_btn.isChecked()
+        self._audio_engine.set_muted(muted)
+        self._mute_btn.setText("\U0001F507 Unmute" if muted else "\U0001F3A4 Mute")
+
     # ------------------------------------------------------------------
     # Slider handlers
     # ------------------------------------------------------------------
@@ -439,6 +521,7 @@ class ScreenShareWidget(QWidget):
 
         self._share_btn.setEnabled(in_room and not someone_sharing)
         self._stop_btn.setEnabled(we_share)
+        self._mute_btn.setEnabled(in_room)
         self._request_btn.setEnabled(
             in_room and someone_sharing and not we_share and self._controller_user_id is None,
         )
@@ -466,3 +549,170 @@ class ScreenShareWidget(QWidget):
 
     def _on_frame_dropped(self, total: int) -> None:
         self._diag_label.setText(f"Dropped frames (queue full): {total}")
+
+    # ------------------------------------------------------------------
+    # Whiteboard handlers
+    # ------------------------------------------------------------------
+
+    def _on_whiteboard_toggled(self) -> None:
+        show_wb = self._whiteboard_btn.isChecked()
+        self._stacked_view.setCurrentIndex(1 if show_wb else 0)
+        self._refresh_controls()
+        if show_wb:
+            # Force graphics view fit-in-view update
+            self._whiteboard_widget.view.fitInView(
+                self._whiteboard_widget.scene.sceneRect(),
+                Qt.AspectRatioMode.KeepAspectRatio
+            )
+
+    def _on_local_draw(self, event_type: str, payload: dict) -> None:
+        """Called when a local shape is completed on the whiteboard widget."""
+        if not self._room_code:
+            return
+        self._whiteboard_engine.send_draw_event(self._room_code, event_type, payload)
+
+    def _on_local_export(self) -> None:
+        """Export the whiteboard canvas as PNG client-side (local rendering)."""
+        scene = self._whiteboard_widget.scene
+        # Create image container with canvas dimensions
+        image = QImage(
+            int(scene.width()),
+            int(scene.height()),
+            QImage.Format.Format_ARGB32_Premultiplied
+        )
+        image.fill(QColor("#1e1e1e"))
+
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        scene.render(painter)
+        painter.end()
+
+        # Prompt user to choose save path
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Whiteboard PNG Export",
+            f"whiteboard_{self._room_code}.png",
+            "PNG Images (*.png);;All Files (*)",
+        )
+        if path:
+            try:
+                if image.save(path, "PNG"):
+                    QMessageBox.information(
+                        self,
+                        "Whiteboard Saved",
+                        f"Whiteboard PNG successfully saved (client-side export) to:\n{path}"
+                    )
+                else:
+                    raise Exception("QImage.save returned False")
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Error Saving File",
+                    f"Failed to save exported whiteboard:\n{exc}"
+                )
+
+    def on_draw_broadcast(self, payload: dict) -> None:
+        """Handle incoming DRAW_BROADCAST — apply to canvas."""
+        if payload.get("room_code") != self._room_code:
+            return
+        seq_num = payload.get("seq_num")
+        user_id = payload.get("user_id")
+        username = payload.get("username", "")
+        event_type = payload.get("event_type", "")
+        data = payload.get("payload", {})
+        client_event_id = payload.get("client_event_id")
+
+        if seq_num is None:
+            return
+
+        self._whiteboard_widget.apply_event(seq_num, user_id, username, event_type, data)
+
+        # If we drew this shape and received confirmed broadcast, push to undo/redo history
+        if user_id == self._user_id:
+            if event_type == "undo":
+                target = data.get("target_seq")
+                if target is not None:
+                    self._whiteboard_widget.record_own_undo(target, seq_num)
+            else:
+                self._whiteboard_widget.record_own_draw(seq_num)
+
+    def on_draw_ack(self, payload: dict) -> None:
+        """Handle incoming DRAW_ACK — confirmation from server."""
+        # Simple confirmation. The actual drawing is applied on DRAW_BROADCAST
+        # to ensure correct state sync among all clients, including sender.
+        pass
+
+    def on_whiteboard_sync(self, payload: dict) -> None:
+        """Handle incoming WHITEBOARD_SYNC — batch load active events."""
+        if payload.get("room_code") != self._room_code:
+            return
+        snapshot_b64 = payload.get("snapshot")
+        events = payload.get("events", [])
+        self._whiteboard_widget.clear_all()
+        if snapshot_b64:
+            self._whiteboard_widget.apply_snapshot(snapshot_b64)
+        for e in events:
+            seq_num = e.get("seq_num")
+            user_id = e.get("user_id")
+            username = e.get("username", "")
+            event_type = e.get("event_type", "")
+            data = e.get("payload", {})
+            if seq_num is not None:
+                self._whiteboard_widget.apply_event(seq_num, user_id, username, event_type, data)
+
+    def on_file_transfer(self, payload: dict) -> None:
+        """Handle incoming FILE_TRANSFER — save exported PNG to local disk."""
+        if payload.get("room_code") != self._room_code:
+            return
+        file_type = payload.get("file_type")
+        if file_type != "whiteboard_export":
+            return
+        file_data_b64 = payload.get("file_data", "")
+        file_name = payload.get("file_name", "whiteboard_export.png")
+
+        if not file_data_b64:
+            return
+
+        try:
+            file_data = base64.b64decode(file_data_b64)
+        except Exception:
+            logger.error("Failed to decode export file data")
+            return
+
+        # Prompt user to choose save path
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Whiteboard PNG Export",
+            file_name,
+            "PNG Images (*.png);;All Files (*)",
+        )
+        if path:
+            try:
+                with open(path, "wb") as f:
+                    f.write(file_data)
+                QMessageBox.information(
+                    self,
+                    "Whiteboard Saved",
+                    f"Whiteboard PNG successfully saved to:\n{path}"
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Error Saving File",
+                    f"Failed to save exported whiteboard:\n{exc}"
+                )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Position subtitle overlay at the bottom-center of stacked view
+        if hasattr(self, "_subtitle_widget") and self._subtitle_widget.isVisible():
+            self._position_subtitle()
+
+    def _position_subtitle(self) -> None:
+        sw = self._subtitle_widget.width()
+        sh = self._subtitle_widget.sizeHint().height()
+        # center horizontally relative to stacked view, place near bottom
+        geom = self._stacked_view.geometry()
+        x = geom.x() + (geom.width() - sw) // 2
+        y = geom.y() + geom.height() - sh - 16
+        self._subtitle_widget.move(max(0, x), max(0, y))

@@ -179,6 +179,28 @@ class LoginWindow(QWidget):
             username = user_info.get("username", "")
             if token:
                 self._store.save_session(token, user_id, username)
+                # Enable auto-reconnect with JWT token
+                lb_host = self._host_input.text().strip() or self._lb_host
+                lb_port = int(self._port_input.text().strip() or self._lb_port)
+                # Use the actual server address (not LB) for reconnection
+                # since the connection was already redirected by the LB
+                if self._conn._reconnect_host is None:
+                    # Store the actual server address used for this connection
+                    try:
+                        peer = self._conn._sock.getpeername() if self._conn._sock else None
+                        if peer:
+                            self._conn.enable_reconnect(
+                                host=peer[0], port=peer[1],
+                                auth_payload={"token": token},
+                                auth_type="jwt",
+                            )
+                    except Exception:
+                        # Fallback to LB address
+                        self._conn.enable_reconnect(
+                            host=lb_host, port=lb_port,
+                            auth_payload={"token": token},
+                            auth_type="jwt",
+                        )
             self.login_success.emit(user_info)
         else:
             self._status_label.setText(error)
