@@ -9,10 +9,10 @@ logger = logging.getLogger(__name__)
 
 def request_server(lb_host: str, lb_port: int, room_code: str | None = None) -> tuple[str, int]:
     """
-    Connect to the load balancer and request a chat server assignment.
-    Returns (server_host, server_port).
-    Raises ConnectionError on failure.
+    Bypass LB for internet testing
     """
+    return lb_host, lb_port
+    
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
     try:

@@ -184,9 +184,11 @@ class SubtitleWorker:
         self._window_seconds = _env_float("QUICKONNECT_STT_WINDOW_SECONDS", 5.0, minimum=1.0)
         self._beam_size = _env_int("QUICKONNECT_STT_BEAM_SIZE", 5, minimum=1)
         self._vad_filter = os.environ.get("QUICKONNECT_STT_VAD_FILTER", "1") != "0"
+        self._min_rms = _env_float("QUICKONNECT_STT_MIN_RMS", 0.008, minimum=0.0)
+        self._min_peak = _env_float("QUICKONNECT_STT_MIN_PEAK", 0.03, minimum=0.0)
         self._initial_prompt = os.environ.get(
             "QUICKONNECT_STT_INITIAL_PROMPT",
-            "The user may speak Vietnamese or English in a QuicKonNect audio call.",
+            "",
         )
         self._window_bytes = int(SAMPLE_RATE * SAMPLE_WIDTH * self._window_seconds)
         self._buffers: dict[int, bytearray] = defaultdict(bytearray)
@@ -201,7 +203,7 @@ class SubtitleWorker:
         if not self._enabled:
             return
         logger.info(
-            "Subtitles enabled for room %s: model=%s language=%s task=%s window=%.1fs beam=%d vad=%s",
+            "Subtitles enabled for room %s: model=%s language=%s task=%s window=%.1fs beam=%d vad=%s min_rms=%.4f min_peak=%.4f",
             self._room_code,
             self._model_name,
             self._language or "auto",
@@ -209,6 +211,8 @@ class SubtitleWorker:
             self._window_seconds,
             self._beam_size,
             self._vad_filter,
+            self._min_rms,
+            self._min_peak,
         )
         self._running = True
         self._thread = threading.Thread(target=self._loop, name=f"subtitle-{self._room_code}", daemon=True)
@@ -256,6 +260,17 @@ class SubtitleWorker:
                 continue
             try:
                 samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                if rms < self._min_rms or peak < self._min_peak:
+                    logger.debug(
+                        "Skipping quiet subtitle window room=%s speaker=%s rms=%.4f peak=%.4f",
+                        self._room_code,
+                        username,
+                        rms,
+                        peak,
+                    )
+                    continue
                 if self._task == "bilingual":
                     subtitle = self._transcribe_bilingual(samples)
                 else:
