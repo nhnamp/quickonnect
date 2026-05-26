@@ -90,6 +90,10 @@ class ChatServer:
 
     def register_client(self, handler) -> None:
         with self._clients_lock:
+            old_handler = self._clients.get(handler.user_id)
+            if old_handler and old_handler is not handler:
+                logger.info("Disconnecting old session for user %s", handler.username)
+                old_handler.disconnect()
             self._clients[handler.user_id] = handler
 
         self._redis.sadd("online_users", str(handler.user_id))
