@@ -667,3 +667,114 @@ docker compose down -v
 
 - If port 5432 is already taken by a local PostgreSQL, either stop the local one (`sudo systemctl stop postgresql`) or change the host port mapping in `docker-compose.yml` to `"5433:5432"` and set `export DB_PORT=5433`.
 - If port 6379 is already taken by a local Redis, stop it (`sudo systemctl stop redis-server`) or remap to `"6380:6379"` and set `export REDIS_PORT=6380`.
+
+## 10. Ngrok Connection
+
+1. Install And Login To ngrok
+On the laptop that runs the servers/load balancer:
+
+ngrok version
+Then add your authtoken from the ngrok dashboard:
+
+ngrok config add-authtoken <YOUR_NGROK_AUTHTOKEN>
+Check where the config file is:
+
+ngrok config check
+2. Create Three TCP Endpoints
+Open the ngrok config:
+
+ngrok config edit
+Use this config shape. If your config already has version and agent, keep them and add only the endpoints block.
+
+version: 3
+
+agent:
+  authtoken: <YOUR_NGROK_AUTHTOKEN>
+
+endpoints:
+  - name: quickonnect-lb
+    url: tcp://
+    upstream:
+      url: 9000
+
+  - name: quickonnect-server-9001
+    url: tcp://
+    upstream:
+      url: 9001
+
+  - name: quickonnect-server-9002
+    url: tcp://
+    upstream:
+      url: 9002
+Start all tunnels:
+
+ngrok start quickonnect-lb quickonnect-server-9001 quickonnect-server-9002
+ngrok will show three forwarding addresses, for example:
+
+quickonnect-lb           tcp://0.tcp.ngrok.io:11111 -> localhost:9000
+quickonnect-server-9001  tcp://2.tcp.ngrok.io:22222 -> localhost:9001
+quickonnect-server-9002  tcp://4.tcp.ngrok.io:33333 -> localhost:9002
+Keep this terminal open.
+
+3. Start QuicKonNect Infrastructure
+In the project folder on the server laptop:
+
+cd QuicKonNect
+source .venv/bin/activate
+docker compose up -d
+python scripts/setup_db.py
+Start the two chat servers in separate terminals:
+
+python scripts/run_server.py 9001
+python scripts/run_server.py 9002
+4. Start The Load Balancer With ngrok Chat Server Addresses
+This is the important part. The load balancer must return the ngrok public chat server addresses, not 127.0.0.1.
+
+Using the example ngrok addresses above:
+
+CHAT_SERVERS="server-9001:2.tcp.ngrok.io:22222,server-9002:4.tcp.ngrok.io:33333" python scripts/run_lb.py
+Do not include tcp:// inside CHAT_SERVERS.
+
+On Windows PowerShell, use:
+
+$env:CHAT_SERVERS="server-9001:2.tcp.ngrok.io:22222,server-9002:4.tcp.ngrok.io:33333"
+python scripts/run_lb.py
+5. Connect From The Remote Laptop
+The remote laptop only needs to run the client.
+
+In the login window, use the load balancer ngrok address:
+
+LB Host: 0.tcp.ngrok.io
+LB Port: 11111
+Again, do not include tcp://.
+
+6. Test Correctly
+Use a regular room, not a DM room:
+
+User 1 logs in.
+User 1 clicks Create in Chat.
+User 2 logs in through the ngrok LB address.
+User 2 clicks Join and enters the same room code.
+Send text messages both ways.
+Open Screen.
+One user clicks Share Screen.
+Other user should see status and frames.
+Then test Request Control.
+Important Limitations
+Random ngrok TCP addresses change when you restart ngrok. If they change, update:
+
+CHAT_SERVERS
+remote client LB Host / Port
+For stable addresses, reserve ngrok TCP addresses in the ngrok dashboard, then put them in the config as:
+
+url: tcp://1.tcp.ngrok.io:12345
+ngrok adds latency and bandwidth overhead. Your app currently sends screen frames at fixed 30 FPS, full scale, JPEG quality 75, so remote internet screen sharing may be slower than LAN.
+
+Quick Debug Checklist
+If login fails: check the quickonnect-lb tunnel.
+
+If room join fails: check quickonnect-server-9001 and quickonnect-server-9002.
+
+If chat works but screen status does not update: make sure both users are in the same regular room, not a DM.
+
+If status updates but no frames: the sharer may have screen capture failure, or ngrok bandwidth is struggling. The sharer should first see their own local preview.
