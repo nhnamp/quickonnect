@@ -1,4 +1,5 @@
 import logging
+import os
 import socket
 
 from shared.constants import PacketType
@@ -8,11 +9,10 @@ logger = logging.getLogger(__name__)
 
 
 def request_server(lb_host: str, lb_port: int, room_code: str | None = None) -> tuple[str, int]:
-    """
-    Bypass LB for internet testing
-    """
-    return lb_host, lb_port
-    
+    if os.environ.get("QUICKONNECT_DIRECT_SERVER", "0") == "1":
+        logger.info("Direct server mode enabled; using %s:%d", lb_host, lb_port)
+        return lb_host, lb_port
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
     try:

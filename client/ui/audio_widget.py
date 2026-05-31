@@ -87,11 +87,11 @@ class AudioWidget(QWidget):
         self._engine.handle_mixed_audio(payload)
 
     def on_subtitle(self, payload: dict) -> None:
-        if payload.get("room_code") != self._room_code:
-            return
+        room_code = str(payload.get("room_code", "")).strip()
         speaker = payload.get("speaker_username", "speaker")
         text = payload.get("text", "").strip()
         lines = payload.get("lines", [])
+        room_suffix = f" ({room_code})" if room_code and room_code != self._room_code else ""
         if isinstance(lines, list) and lines:
             rendered_lines = []
             for line in lines:
@@ -102,7 +102,7 @@ class AudioWidget(QWidget):
                 if value:
                     rendered_lines.append(f"{lang}: {value}")
             if rendered_lines:
-                item = QListWidgetItem(f"{speaker}\n" + "\n".join(rendered_lines))
+                item = QListWidgetItem(f"{speaker}{room_suffix}\n" + "\n".join(rendered_lines))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
                 item.setSizeHint(QSize(0, 22 * (len(rendered_lines) + 1)))
                 self._subtitle_list.addItem(item)
@@ -115,7 +115,7 @@ class AudioWidget(QWidget):
             return
         task = payload.get("task", "transcribe")
         suffix = " → EN" if task == "translate" else ""
-        item = QListWidgetItem(f"{speaker}{suffix}: {text}")
+        item = QListWidgetItem(f"{speaker}{room_suffix}{suffix}: {text}")
         item.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
         self._subtitle_list.addItem(item)
         self._subtitle_list.scrollToBottom()

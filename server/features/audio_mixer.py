@@ -318,21 +318,24 @@ class SubtitleWorker:
         source_lang = _normalize_language(original["language"])
         original_text = original["text"]
         if source_lang == "en":
-            target_lang = "vi"
-            translated = _translate_text(original_text, "en", "vi")
+            english_text = original_text
+            vietnamese_text = _translate_text(original_text, "en", "vi")
         else:
-            target_lang = "en"
-            translated = self._whisper_translate_to_english(samples)
+            source_lang = "vi"
+            vietnamese_text = original_text
+            english_text = self._whisper_translate_to_english(samples)
 
-        lines = [{"lang": source_lang, "text": original_text}]
-        if translated:
-            lines.append({"lang": target_lang, "text": translated})
+        lines = []
+        if english_text:
+            lines.append({"lang": "en", "text": english_text})
+        if vietnamese_text:
+            lines.append({"lang": "vi", "text": vietnamese_text})
         return {
             "task": "bilingual",
             "language": source_lang,
             "text": original_text,
-            "translation": translated,
-            "target_language": target_lang,
+            "translation": vietnamese_text if source_lang == "en" else english_text,
+            "target_language": "vi" if source_lang == "en" else "en",
             "lines": lines,
         }
 
