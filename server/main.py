@@ -54,6 +54,22 @@ class ChatServer:
         logger.info("Stopping chat server %s", self.config.server_id)
         self._running = False
 
+        # Phase 5: notify all clients of impending shutdown
+        from shared.constants import PacketType as PT
+        with self._clients_lock:
+            for handler in list(self._clients.values()):
+                try:
+                    handler.send(PT.SERVER_SHUTDOWN, {
+                        "message": "Server is shutting down",
+                        "reconnect_delay": 5,
+                    })
+                except Exception:
+                    pass
+
+        # Give clients a moment to process the shutdown notification
+        import time
+        time.sleep(1)
+
         if self._acceptor:
             self._acceptor.stop()
 
@@ -74,6 +90,10 @@ class ChatServer:
 
     def register_client(self, handler) -> None:
         with self._clients_lock:
+            old_handler = self._clients.get(handler.user_id)
+            if old_handler and old_handler is not handler:
+                logger.info("Disconnecting old session for user %s", handler.username)
+                old_handler.disconnect()
             self._clients[handler.user_id] = handler
 
         self._redis.sadd("online_users", str(handler.user_id))
@@ -150,7 +170,7 @@ class ChatServer:
     # ------------------------------------------------------------------
 
     def _start_pubsub_listener(self):
-        self._pubsub.subscribe("user_status", "friend_events", "dm_messages")
+        self._pubsub.subscribe("user_status", "friend_events", "dm_messages", "room_invites")
         self._pubsub_thread = threading.Thread(target=self._pubsub_loop, daemon=True)
         self._pubsub_thread.start()
 
@@ -172,6 +192,8 @@ class ChatServer:
                     self._handle_friend_event(data)
                 elif channel == "dm_messages":
                     self._handle_dm_message(data)
+                elif channel == "room_invites":
+                    self._handle_room_invite_pubsub(data)
             except Exception:
                 logger.debug("Failed to process pub/sub message")
 
@@ -252,6 +274,25 @@ class ChatServer:
             self._redis.hdel("servers", self.config.server_id)
         except Exception:
             pass
+
+    def _handle_room_invite_pubsub(self, data: dict):
+        """Deliver a room invite published by another server."""
+        from shared.constants import PacketType
+
+        if data.get("originating_server_id") == self.config.server_id:
+            return
+
+        target_username = data.get("target_username", "")
+        if not target_username:
+            return
+
+        handler = self.get_client_by_username(target_username)
+        if handler is not None:
+            handler.send(PacketType.ROOM_INVITE_NOTIFY, {
+                "room_code": data.get("room_code", ""),
+                "from_user_id": data.get("from_user_id"),
+                "from_username": data.get("from_username", ""),
+            })
 
 
 def run_server(config: ServerConfig | None = None):

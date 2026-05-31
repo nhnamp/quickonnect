@@ -170,3 +170,61 @@ def decode_jwt(token: str, secret: str) -> dict | None:
         return None
 
     return payload
+
+
+# ---------------------------------------------------------------------------
+# E2E Message Encryption (for DM text messages)
+# ---------------------------------------------------------------------------
+
+def e2e_encrypt_message(plaintext: str, recipient_pub_key) -> dict:
+    """Encrypt a message for E2E delivery.
+
+    Generates a random AES-256 key, encrypts the message with AES-GCM,
+    then wraps the AES key with the recipient's RSA public key.
+    Returns a dict with encrypted_content, encrypted_key, nonce, and tag
+    (all base64-encoded).
+    """
+    aes_key = generate_aes_key()
+    plaintext_bytes = plaintext.encode("utf-8")
+    nonce, ciphertext, tag = aes_encrypt(aes_key, plaintext_bytes)
+    encrypted_key = rsa_encrypt(recipient_pub_key, aes_key)
+    return {
+        "encrypted_content": base64.b64encode(ciphertext).decode("ascii"),
+        "encrypted_key": base64.b64encode(encrypted_key).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii"),
+    }
+
+
+def e2e_decrypt_message(encrypted_data: dict, private_key) -> str:
+    """Decrypt an E2E encrypted message.
+
+    Unwraps the AES key with the recipient's RSA private key,
+    then decrypts the message content with AES-GCM.
+    Returns the plaintext string. Raises ValueError on failure.
+    """
+    try:
+        encrypted_key = base64.b64decode(encrypted_data["encrypted_key"])
+        aes_key = rsa_decrypt(private_key, encrypted_key)
+        ciphertext = base64.b64decode(encrypted_data["encrypted_content"])
+        nonce = base64.b64decode(encrypted_data["nonce"])
+        tag = base64.b64decode(encrypted_data["tag"])
+        plaintext_bytes = aes_decrypt(aes_key, nonce, ciphertext, tag)
+        return plaintext_bytes.decode("utf-8")
+    except Exception as e:
+        raise ValueError(f"Failed to decrypt E2E message: {e}") from e
+
+
+def serialize_private_key(private_key) -> bytes:
+    """Serialize RSA private key to PEM bytes (no password protection)."""
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def deserialize_private_key(pem_bytes: bytes):
+    """Deserialize RSA private key from PEM bytes."""
+    return serialization.load_pem_private_key(pem_bytes, password=None)
+
