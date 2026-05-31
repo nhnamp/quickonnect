@@ -17,6 +17,7 @@ from shared.crypto import (
 logger = logging.getLogger(__name__)
 
 _MAX_AUDIO_B64_LEN = 4096
+_MAX_CAMERA_B64_LEN = 1024 * 1024
 
 
 class ClientHandler(threading.Thread):
@@ -216,6 +217,9 @@ class ClientHandler(threading.Thread):
             PacketType.SCREEN_START: self._handle_screen_start,
             PacketType.SCREEN_STOP: self._handle_screen_stop,
             PacketType.SCREEN_FRAME: self._handle_screen_frame,
+            PacketType.CAMERA_START: self._handle_camera_start,
+            PacketType.CAMERA_STOP: self._handle_camera_stop,
+            PacketType.CAMERA_FRAME: self._handle_camera_frame,
             PacketType.REMOTE_REQUEST: self._handle_remote_request,
             PacketType.REMOTE_GRANT: self._handle_remote_grant,
             PacketType.REMOTE_EVENT: self._handle_remote_event,
@@ -288,6 +292,13 @@ class ClientHandler(threading.Thread):
                 "controller_user_id": info.controller_user_id,
                 "controller_username": info.controller_username,
             }
+        camera = room_manager.get_camera_state(room_code)
+        if camera is not None:
+            state_payload["cameras"] = [
+                user.to_dict()
+                for user in camera.get_active()
+                if user.user_id != self.user_id
+            ]
         self.send(PacketType.ROOM_STATE, state_payload)
 
         history = self._server.message_service.get_history(state.room_id)
@@ -351,10 +362,18 @@ class ClientHandler(threading.Thread):
                         "sharer_user_id": controller_cleared_info.sharer_user_id,
                     })
 
+        camera = self._server.room_manager.get_camera_state(room_code)
+        camera_stopped = camera.stop_camera(self.user_id) if camera is not None else False
+
         self._current_rooms.discard(room_code)
         remaining = self._server.room_manager.leave_room(room_code, self.user_id)
 
         for handler in remaining:
+            if camera_stopped:
+                handler.send(PacketType.CAMERA_STOP, {
+                    "room_code": room_code,
+                    "user_id": self.user_id,
+                })
             handler.send(PacketType.ROOM_UPDATE, {
                 "room_code": room_code,
                 "event": "left",
@@ -546,6 +565,67 @@ class ClientHandler(threading.Thread):
             "seq": packet.payload.get("seq", 0),
         }
         self._broadcast_to_room(room_code, PacketType.SCREEN_RELAY, relay_payload,
+                                include_self=False)
+
+    def _handle_camera_start(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            self.send(PacketType.ERROR, {"code": 403, "message": "Not in this room"})
+            return
+        camera = self._server.room_manager.get_camera_state(room_code)
+        if camera is None:
+            self.send(PacketType.ERROR, {"code": 404, "message": "Room not found"})
+            return
+        camera.start_camera(self.user_id, self.username)
+        logger.info("Room %s: camera started by %s", room_code, self.username)
+        self._broadcast_to_room(room_code, PacketType.CAMERA_START, {
+            "room_code": room_code,
+            "user_id": self.user_id,
+            "username": self.username,
+        })
+
+    def _handle_camera_stop(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        camera = self._server.room_manager.get_camera_state(room_code)
+        if camera is None:
+            return
+        if not camera.stop_camera(self.user_id):
+            return
+        logger.info("Room %s: camera stopped by %s", room_code, self.username)
+        self._broadcast_to_room(room_code, PacketType.CAMERA_STOP, {
+            "room_code": room_code,
+            "user_id": self.user_id,
+        })
+
+    def _handle_camera_frame(self, packet: Packet):
+        room_code = packet.payload.get("room_code", "").strip()
+        if not room_code or room_code not in self._current_rooms:
+            return
+        camera = self._server.room_manager.get_camera_state(room_code)
+        if camera is None or not camera.is_active(self.user_id):
+            return
+        jpeg_b64 = packet.payload.get("jpeg_b64", "")
+        if not isinstance(jpeg_b64, str) or not jpeg_b64:
+            return
+        if len(jpeg_b64) > _MAX_CAMERA_B64_LEN:
+            logger.warning(
+                "Rejecting oversized camera frame from %s in room %s: %d bytes base64",
+                self.username, room_code, len(jpeg_b64),
+            )
+            self.send(PacketType.ERROR, {"code": 413, "message": "Camera frame too large"})
+            return
+        relay_payload = {
+            "room_code": room_code,
+            "user_id": self.user_id,
+            "username": self.username,
+            "jpeg_b64": jpeg_b64,
+            "width": packet.payload.get("width", 0),
+            "height": packet.payload.get("height", 0),
+            "seq": packet.payload.get("seq", 0),
+        }
+        self._broadcast_to_room(room_code, PacketType.CAMERA_RELAY, relay_payload,
                                 include_self=False)
 
     def _handle_remote_request(self, packet: Packet):
@@ -886,9 +966,7 @@ class ClientHandler(threading.Thread):
             # the recipient list is still intact.
             for room_code in list(self._current_rooms):
                 screen = self._server.room_manager.get_screen_state(room_code)
-                if screen is None:
-                    continue
-                if screen.stop_if_sharer(self.user_id):
+                if screen is not None and screen.stop_if_sharer(self.user_id):
                     clients = self._server.room_manager.get_room_clients(room_code)
                     for uid, handler in clients.items():
                         if uid != self.user_id:
@@ -896,7 +974,7 @@ class ClientHandler(threading.Thread):
                                 "room_code": room_code,
                                 "sharer_user_id": self.user_id,
                             })
-                elif screen.clear_controller_if(self.user_id):
+                elif screen is not None and screen.clear_controller_if(self.user_id):
                     info = screen.get_state()
                     clients = self._server.room_manager.get_room_clients(room_code)
                     for uid, handler in clients.items():
@@ -907,6 +985,15 @@ class ClientHandler(threading.Thread):
                                 "target_user_id": None,
                                 "target_username": None,
                                 "sharer_user_id": info.sharer_user_id if info else None,
+                            })
+                camera = self._server.room_manager.get_camera_state(room_code)
+                if camera is not None and camera.stop_camera(self.user_id):
+                    clients = self._server.room_manager.get_room_clients(room_code)
+                    for uid, handler in clients.items():
+                        if uid != self.user_id:
+                            handler.send(PacketType.CAMERA_STOP, {
+                                "room_code": room_code,
+                                "user_id": self.user_id,
                             })
 
             left_rooms = self._server.room_manager.remove_client_from_all_rooms(self.user_id)

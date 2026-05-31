@@ -27,6 +27,7 @@ from client.features import screen_engine
 from client.features.screen_engine import ScreenCaptureEngine, decode_jpeg
 from client.features.remote_control import RemoteControlSender, RemoteControlExecutor
 from client.features.audio_engine import AudioEngine
+from client.features.camera_engine import CameraEngine, decode_camera_jpeg
 from client.features.whiteboard_engine import WhiteboardEngine
 from client.ui.subtitle_widget import SubtitleWidget
 from client.ui.whiteboard_widget import WhiteboardWidget
@@ -89,6 +90,36 @@ class FrameLabel(QLabel):
         self._draw_geom = (ox, oy, scaled.width(), scaled.height())
 
 
+class CameraTile(QLabel):
+    """Small camera preview tile for local and remote participants."""
+
+    def __init__(self, username: str, parent=None) -> None:
+        super().__init__(parent)
+        self._source: QImage | None = None
+        self.setFixedSize(176, 120)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background-color: #111; color: #ddd; border: 1px solid #333;")
+        self.setText(f"{username}\nCamera on")
+
+    def set_frame(self, image: QImage) -> None:
+        self._source = image
+        self._refresh_pixmap()
+
+    def resizeEvent(self, event):  # noqa: N802
+        self._refresh_pixmap()
+        super().resizeEvent(event)
+
+    def _refresh_pixmap(self) -> None:
+        if self._source is None or self._source.isNull():
+            return
+        scaled = self._source.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(QPixmap.fromImage(scaled))
+
+
 class ScreenShareWidget(QWidget):
     """The Screen tab. One instance per main window."""
 
@@ -120,6 +151,10 @@ class ScreenShareWidget(QWidget):
         )
 
         self._audio_engine = AudioEngine(connection_manager)
+        self._camera_engine = CameraEngine(connection_manager, self)
+        self._camera_engine.frame_captured.connect(self._on_local_camera_frame)
+        self._camera_engine.stopped.connect(self._on_camera_engine_stopped)
+        self._camera_tiles: dict[int, CameraTile] = {}
         self._whiteboard_engine = WhiteboardEngine(connection_manager, username)
 
         self._build_ui()
@@ -148,6 +183,13 @@ class ScreenShareWidget(QWidget):
         self._stacked_view.addWidget(self._whiteboard_widget)
         layout.addWidget(self._stacked_view, stretch=1)
 
+        self._camera_strip = QWidget(self)
+        self._camera_layout = QHBoxLayout(self._camera_strip)
+        self._camera_layout.setContentsMargins(0, 6, 0, 6)
+        self._camera_layout.setSpacing(8)
+        self._camera_strip.hide()
+        layout.addWidget(self._camera_strip)
+
         # Controls row 1: share / stop / request control / revoke + audio mute
         btn_row = QHBoxLayout()
         self._share_btn = QPushButton("Share Screen")
@@ -172,10 +214,19 @@ class ScreenShareWidget(QWidget):
         )
         self._mute_btn.clicked.connect(self._on_mute_toggled)
 
+        self._camera_btn = QPushButton("Camera On")
+        self._camera_btn.setCheckable(True)
+        self._camera_btn.setStyleSheet(
+            "QPushButton { padding: 4px 12px; }"
+            "QPushButton:checked { background-color: #2c7be5; color: white; }"
+        )
+        self._camera_btn.clicked.connect(self._on_camera_toggled)
+
         btn_row.addWidget(self._share_btn)
         btn_row.addWidget(self._stop_btn)
         btn_row.addWidget(self._whiteboard_btn)
         btn_row.addWidget(self._mute_btn)
+        btn_row.addWidget(self._camera_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._request_btn)
         btn_row.addWidget(self._revoke_btn)
@@ -231,6 +282,7 @@ class ScreenShareWidget(QWidget):
     # ------------------------------------------------------------------
 
     def set_current_room(self, room_code: str | None) -> None:
+        room_code = room_code or None
         if room_code == self._room_code:
             return
         # Switching rooms drops any local-side state we know about; the
@@ -239,8 +291,14 @@ class ScreenShareWidget(QWidget):
         if self._engine.is_running():
             self._engine.stop("Switched room")
             self._send_screen_stop(self._room_code)
+        if self._camera_engine.is_running():
+            old_room = self._room_code
+            self._camera_engine.stop("Switched room")
+            self._send_camera_stop(old_room)
         # Stop audio in the old room
         self._audio_engine.stop()
+        self._clear_camera_tiles()
+        self._set_camera_button_checked(False)
         self._whiteboard_widget.clear_all()
         self._whiteboard_btn.setChecked(False)
         self._stacked_view.setCurrentIndex(0)
@@ -258,6 +316,15 @@ class ScreenShareWidget(QWidget):
                 self._diag_label.setText(error)
             else:
                 self._diag_label.setText("")
+
+    def handle_room_state_cameras(self, cameras: list) -> None:
+        """Apply active camera users carried by a ROOM_STATE payload."""
+        for camera in cameras or []:
+            user_id = camera.get("user_id")
+            username = camera.get("username", "")
+            if user_id is None:
+                continue
+            self._ensure_camera_tile(int(user_id), username or f"User {user_id}")
 
     def handle_room_state_screen(self, screen_info: dict | None) -> None:
         """Apply any active share carried by a ROOM_STATE payload."""
@@ -391,6 +458,43 @@ class ScreenShareWidget(QWidget):
         if pcm_b64:
             self._audio_engine.feed_playback(pcm_b64)
 
+    def on_camera_start(self, payload: dict) -> None:
+        if payload.get("room_code") != self._room_code:
+            return
+        user_id = payload.get("user_id")
+        username = payload.get("username", "")
+        if user_id is None:
+            return
+        self._ensure_camera_tile(int(user_id), username or f"User {user_id}")
+
+    def on_camera_stop(self, payload: dict) -> None:
+        if payload.get("room_code") != self._room_code:
+            return
+        user_id = payload.get("user_id")
+        if user_id is None:
+            return
+        if int(user_id) == self._user_id and self._camera_engine.is_running():
+            self._camera_engine.stop("Stop received from server")
+        self._remove_camera_tile(int(user_id))
+        if int(user_id) == self._user_id:
+            self._set_camera_button_checked(False)
+
+    def on_camera_relay(self, payload: dict) -> None:
+        if payload.get("room_code") != self._room_code:
+            return
+        user_id = payload.get("user_id")
+        if user_id is None:
+            return
+        jpeg_b64 = payload.get("jpeg_b64", "")
+        if not jpeg_b64:
+            return
+        image = decode_camera_jpeg(jpeg_b64)
+        if image is None or image.isNull():
+            logger.debug("Ignoring invalid camera frame from user_id=%s", user_id)
+            return
+        username = payload.get("username", "") or f"User {user_id}"
+        self._ensure_camera_tile(int(user_id), username).set_frame(image)
+
     def on_subtitle(self, payload: dict) -> None:
         """Handle incoming SUBTITLE packet — show subtitle overlay."""
         if payload.get("room_code") != self._room_code:
@@ -406,6 +510,7 @@ class ScreenShareWidget(QWidget):
         """Called on logout / disconnect — stop any local threads."""
         if self._engine.is_running():
             self._engine.stop("Shutdown")
+        self._camera_engine.stop("Shutdown")
         self._audio_engine.stop()
         self._executor.stop()
         self._remote_sender.detach()
@@ -514,6 +619,12 @@ class ScreenShareWidget(QWidget):
         self._audio_engine.set_muted(muted)
         self._mute_btn.setText("\U0001F507 Unmute" if muted else "\U0001F3A4 Mute")
 
+    def _on_camera_toggled(self) -> None:
+        if self._camera_btn.isChecked():
+            self._start_local_camera()
+        else:
+            self._stop_local_camera("User stopped", notify=True)
+
     def _on_fps_changed(self, value: int) -> None:
         fps = max(1, int(value))
         self._fps_value.setText(str(fps))
@@ -541,6 +652,82 @@ class ScreenShareWidget(QWidget):
             return
         self.send_packet.emit(int(PacketType.SCREEN_STOP), {"room_code": room_code})
 
+    def _send_camera_stop(self, room_code: str | None) -> None:
+        if not room_code:
+            return
+        self.send_packet.emit(int(PacketType.CAMERA_STOP), {"room_code": room_code})
+
+    def _start_local_camera(self) -> None:
+        if not self._room_code:
+            QMessageBox.information(self, "Camera", "Pick a room in the Chat tab first.")
+            self._set_camera_button_checked(False)
+            return
+        ok, error = self._camera_engine.start(self._room_code)
+        if not ok:
+            logger.warning("Camera startup failed: %s", error)
+            QMessageBox.warning(self, "Camera", error or "Could not start camera.")
+            self._set_camera_button_checked(False)
+            return
+        self.send_packet.emit(int(PacketType.CAMERA_START), {"room_code": self._room_code})
+        self._ensure_camera_tile(self._user_id, self._username)
+        self._set_camera_button_checked(True)
+
+    def _stop_local_camera(self, reason: str, *, notify: bool) -> None:
+        room_code = self._room_code
+        if self._camera_engine.is_running():
+            self._camera_engine.stop(reason)
+        if notify:
+            self._send_camera_stop(room_code)
+        self._remove_camera_tile(self._user_id)
+        self._set_camera_button_checked(False)
+
+    def _set_camera_button_checked(self, checked: bool) -> None:
+        self._camera_btn.blockSignals(True)
+        self._camera_btn.setChecked(checked)
+        self._camera_btn.blockSignals(False)
+        self._camera_btn.setText("Camera Off" if checked else "Camera On")
+
+    def _ensure_camera_tile(self, user_id: int, username: str) -> CameraTile:
+        tile = self._camera_tiles.get(user_id)
+        if tile is not None:
+            return tile
+        tile = CameraTile("You" if user_id == self._user_id else username, self._camera_strip)
+        self._camera_tiles[user_id] = tile
+        self._camera_layout.addWidget(tile)
+        self._camera_strip.show()
+        return tile
+
+    def _remove_camera_tile(self, user_id: int) -> None:
+        tile = self._camera_tiles.pop(user_id, None)
+        if tile is None:
+            return
+        self._camera_layout.removeWidget(tile)
+        tile.deleteLater()
+        if not self._camera_tiles:
+            self._camera_strip.hide()
+
+    def _clear_camera_tiles(self) -> None:
+        for user_id in list(self._camera_tiles):
+            self._remove_camera_tile(user_id)
+
+    def _on_local_camera_frame(self, image: QImage) -> None:
+        self._ensure_camera_tile(self._user_id, self._username).set_frame(image)
+
+    def _on_camera_engine_stopped(self, reason: str) -> None:
+        normal_reasons = {
+            "User stopped",
+            "Stop received from server",
+            "Switched room",
+            "Shutdown",
+        }
+        if reason in normal_reasons:
+            return
+        logger.error("Camera stopped unexpectedly: %s", reason)
+        self._send_camera_stop(self._room_code)
+        self._remove_camera_tile(self._user_id)
+        self._set_camera_button_checked(False)
+        QMessageBox.warning(self, "Camera", reason or "Camera stopped unexpectedly.")
+
     def _clear_share_state(self) -> None:
         self._sharer_user_id = None
         self._sharer_username = ""
@@ -557,6 +744,7 @@ class ScreenShareWidget(QWidget):
         self._share_btn.setEnabled(in_room and not someone_sharing)
         self._stop_btn.setEnabled(we_share)
         self._mute_btn.setEnabled(in_room)
+        self._camera_btn.setEnabled(in_room)
         self._request_btn.setEnabled(
             in_room and someone_sharing and not we_share and self._controller_user_id is None,
         )

@@ -33,7 +33,7 @@ class ChatWidget(QWidget):
     """Chat panel: room list on the left, message view + participant list on the right."""
     send_packet = pyqtSignal(int, dict)  # packet_type, payload
     join_room_requested = pyqtSignal(str)  # regular room code entered via Join button
-    room_changed = pyqtSignal(str)       # emitted when _current_room changes (Phase 2 hookup)
+    room_changed = pyqtSignal(object)    # str room code, or None after leaving all rooms
 
     def __init__(self):
         super().__init__()
@@ -218,6 +218,7 @@ class ChatWidget(QWidget):
         self._update_message_view()
         self._update_participant_list()
         self._set_input_enabled(False)
+        self.room_changed.emit(None)
 
     def add_room(self, room_code: str, room_id: int = 0):
         """Called when the server confirms room join."""

@@ -276,6 +276,7 @@ class MainWindow(QMainWindow):
             # Phase 2: surface any active share that already exists in the room.
             self._screen_widget.set_current_room(room_code)
             self._screen_widget.handle_room_state_screen(data.get("screen"))
+            self._screen_widget.handle_room_state_cameras(data.get("cameras", []))
             # Update connection manager's room list for reconnection
             self._conn.update_room_codes(self._chat_widget.get_room_codes())
 
@@ -308,6 +309,15 @@ class MainWindow(QMainWindow):
 
         elif ptype == PacketType.SCREEN_RELAY:
             self._screen_widget.on_screen_relay(data)
+
+        elif ptype == PacketType.CAMERA_START:
+            self._screen_widget.on_camera_start(data)
+
+        elif ptype == PacketType.CAMERA_STOP:
+            self._screen_widget.on_camera_stop(data)
+
+        elif ptype == PacketType.CAMERA_RELAY:
+            self._screen_widget.on_camera_relay(data)
 
         elif ptype == PacketType.REMOTE_REQUEST:
             self._screen_widget.on_remote_request(data)
