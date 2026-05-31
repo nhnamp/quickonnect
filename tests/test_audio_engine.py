@@ -4,6 +4,7 @@ from client.features.audio_engine import (
     AudioEngine,
     CHUNK_SIZE,
     FRAME_DURATION_MS,
+    _PcmResampler,
     SAMPLE_RATE,
     SAMPLE_WIDTH,
 )
@@ -46,3 +47,24 @@ def test_resample_pcm_mono16_changes_sample_count() -> None:
     resampled = AudioEngine._resample_pcm_mono16(pcm, source_rate, target_rate)
 
     assert len(resampled) == CHUNK_SIZE * SAMPLE_WIDTH
+
+
+def test_stateful_resampler_produces_stable_chunk_sizes() -> None:
+    resampler = _PcmResampler(48000, SAMPLE_RATE)
+    source_samples = int(48000 * FRAME_DURATION_MS / 1000)
+    pcm = b"\x00\x00" * source_samples
+
+    first = resampler.process(pcm, CHUNK_SIZE)
+    second = resampler.process(pcm, CHUNK_SIZE)
+
+    assert len(first) == CHUNK_SIZE * SAMPLE_WIDTH
+    assert len(second) == CHUNK_SIZE * SAMPLE_WIDTH
+
+
+def test_pcm_peak_rms_reports_signal_level() -> None:
+    pcm = (1000).to_bytes(2, "little", signed=True) * CHUNK_SIZE
+
+    peak, rms = AudioEngine._pcm_peak_rms(pcm)
+
+    assert peak == 1000
+    assert rms == 1000

@@ -27,6 +27,57 @@ FRAME_DURATION_MS = 20
 CHUNK_SIZE = 320        # samples per read/write
 
 
+class _PcmResampler:
+    """Stateful mono int16 linear resampler for continuous 20 ms audio chunks."""
+
+    def __init__(self, source_rate: int, target_rate: int) -> None:
+        self._source_rate = source_rate
+        self._target_rate = target_rate
+        self._ratio = source_rate / target_rate
+        self._samples: list[int] = []
+        self._position = 0.0
+
+    def process(self, pcm_data: bytes, output_samples: int) -> bytes:
+        if self._source_rate == self._target_rate:
+            return pcm_data
+        if len(pcm_data) % SAMPLE_WIDTH:
+            pcm_data = pcm_data[:-1]
+        if not pcm_data or output_samples <= 0:
+            return b""
+
+        sample_count = len(pcm_data) // SAMPLE_WIDTH
+        self._samples.extend(struct.unpack(f"<{sample_count}h", pcm_data))
+        if not self._samples:
+            return b""
+
+        out: list[int] = []
+        for _ in range(output_samples):
+            left = int(self._position)
+            if left >= len(self._samples) - 1:
+                value = self._samples[-1]
+            else:
+                frac = self._position - left
+                value = int(
+                    self._samples[left] * (1.0 - frac)
+                    + self._samples[left + 1] * frac
+                )
+            if value > 32767:
+                value = 32767
+            elif value < -32768:
+                value = -32768
+            out.append(value)
+            self._position += self._ratio
+
+        # Keep one sample before the next read position so interpolation across
+        # chunk boundaries stays continuous instead of restarting every frame.
+        drop = max(0, int(self._position) - 1)
+        if drop:
+            del self._samples[:drop]
+            self._position -= drop
+
+        return struct.pack(f"<{len(out)}h", *out)
+
+
 class AudioEngine:
     """Captures microphone input and plays back mixed audio from the server.
 
@@ -54,6 +105,11 @@ class AudioEngine:
         self._output_rate = SAMPLE_RATE
         self._capture_chunk_size = CHUNK_SIZE
         self._playback_chunk_size = CHUNK_SIZE
+        self._capture_resampler: _PcmResampler | None = None
+        self._playback_resampler: _PcmResampler | None = None
+        self._capture_sent = 0
+        self._playback_received = 0
+        self._playback_written = 0
 
         self._capture_thread: threading.Thread | None = None
         self._playback_thread: threading.Thread | None = None
@@ -90,6 +146,19 @@ class AudioEngine:
         self._room_code = room_code
         self._running = True
         self._seq = 0
+        self._capture_sent = 0
+        self._playback_received = 0
+        self._playback_written = 0
+        self._capture_resampler = (
+            _PcmResampler(self._input_rate, SAMPLE_RATE)
+            if self._input_rate != SAMPLE_RATE
+            else None
+        )
+        self._playback_resampler = (
+            _PcmResampler(SAMPLE_RATE, self._output_rate)
+            if self._output_rate != SAMPLE_RATE
+            else None
+        )
 
         self._capture_thread = threading.Thread(
             target=self._capture_loop, name="audio-capture", daemon=True,
@@ -133,6 +202,8 @@ class AudioEngine:
 
         self._capture_thread = None
         self._playback_thread = None
+        self._capture_resampler = None
+        self._playback_resampler = None
 
         logger.info("AudioEngine stopped")
 
@@ -299,28 +370,21 @@ class AudioEngine:
             pcm_data = pcm_data[:-1]
         if not pcm_data:
             return b""
+        sample_count = len(pcm_data) // SAMPLE_WIDTH
+        target_count = max(1, int(round(sample_count * target_rate / source_rate)))
+        return _PcmResampler(source_rate, target_rate).process(pcm_data, target_count)
 
+    @staticmethod
+    def _pcm_peak_rms(pcm_data: bytes) -> tuple[int, int]:
+        if len(pcm_data) % SAMPLE_WIDTH:
+            pcm_data = pcm_data[:-1]
+        if not pcm_data:
+            return 0, 0
         sample_count = len(pcm_data) // SAMPLE_WIDTH
         samples = struct.unpack(f"<{sample_count}h", pcm_data)
-        target_count = max(1, int(round(sample_count * target_rate / source_rate)))
-        ratio = source_rate / target_rate
-        out: list[int] = []
-
-        for i in range(target_count):
-            pos = i * ratio
-            left = int(pos)
-            if left >= sample_count - 1:
-                out.append(samples[-1])
-                continue
-            frac = pos - left
-            value = int(samples[left] * (1.0 - frac) + samples[left + 1] * frac)
-            if value > 32767:
-                value = 32767
-            elif value < -32768:
-                value = -32768
-            out.append(value)
-
-        return struct.pack(f"<{len(out)}h", *out)
+        peak = max(abs(sample) for sample in samples)
+        mean_square = sum(sample * sample for sample in samples) / sample_count
+        return peak, int(mean_square ** 0.5)
 
     # ------------------------------------------------------------------
     # Mute control (thread-safe)
@@ -353,8 +417,16 @@ class AudioEngine:
         except Exception:
             logger.warning("Failed to decode playback audio data")
             return
+        if len(pcm_data) != CHUNK_SIZE * SAMPLE_WIDTH:
+            logger.warning("Unexpected playback frame size: %d bytes", len(pcm_data))
         try:
             self._playback_queue.put_nowait(pcm_data)
+            self._playback_received += 1
+            if self._playback_received % 100 == 0:
+                logger.info(
+                    "Audio playback queue received %d mixed frames (queue=%d)",
+                    self._playback_received, self._playback_queue.qsize(),
+                )
         except queue.Full:
             logger.debug("Playback queue full — dropping audio frame")
 
@@ -402,15 +474,22 @@ class AudioEngine:
 
                 if self._input_rate != SAMPLE_RATE:
                     try:
-                        pcm_data = self._resample_pcm_mono16(
-                            pcm_data, self._input_rate, SAMPLE_RATE,
-                        )
+                        if self._capture_resampler is None:
+                            self._capture_resampler = _PcmResampler(self._input_rate, SAMPLE_RATE)
+                        pcm_data = self._capture_resampler.process(pcm_data, CHUNK_SIZE)
                     except Exception:
                         logger.warning("Mic resample error — skipping frame")
                         continue
                 pcm_data = self._fit_pcm_frame(pcm_data)
 
                 self._seq += 1
+                self._capture_sent += 1
+                if self._capture_sent % 100 == 0:
+                    peak, rms = self._pcm_peak_rms(pcm_data)
+                    logger.info(
+                        "Audio capture sent %d frames room=%s rate=%d peak=%d rms=%d",
+                        self._capture_sent, self._room_code, self._input_rate, peak, rms,
+                    )
                 pcm_b64 = base64.b64encode(pcm_data).decode("ascii")
 
                 self._conn.send(PacketType.AUDIO_CHUNK, {
@@ -472,10 +551,19 @@ class AudioEngine:
 
                 try:
                     if self._output_rate != SAMPLE_RATE:
-                        pcm_data = self._resample_pcm_mono16(
-                            pcm_data, SAMPLE_RATE, self._output_rate,
+                        if self._playback_resampler is None:
+                            self._playback_resampler = _PcmResampler(SAMPLE_RATE, self._output_rate)
+                        pcm_data = self._playback_resampler.process(
+                            pcm_data, self._playback_chunk_size,
                         )
                     stream.write(pcm_data)
+                    self._playback_written += 1
+                    if self._playback_written % 100 == 0:
+                        peak, rms = self._pcm_peak_rms(pcm_data)
+                        logger.info(
+                            "Audio playback wrote %d frames rate=%d peak=%d rms=%d",
+                            self._playback_written, self._output_rate, peak, rms,
+                        )
                 except Exception:
                     if self._running:
                         logger.warning("Speaker write error — skipping frame")
