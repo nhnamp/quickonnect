@@ -118,12 +118,16 @@ class RemoteControlSender(QObject):
         if self._watched_widget is not None:
             try:
                 self._watched_widget.removeEventFilter(self)
+                self._watched_widget.clearFocus()
             except Exception:
                 pass
             self._watched_widget = None
+        self._enabled = False
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
+        if enabled and self._watched_widget is not None:
+            self._watched_widget.setFocus(Qt.FocusReason.OtherFocusReason)
 
     # ------------------------------------------------------------------
     # Qt event filter
@@ -138,19 +142,21 @@ class RemoteControlSender(QObject):
             self._handle_mouse(event, kind="move")
             return False
         if etype == QEvent.Type.MouseButtonPress:
-            self._handle_mouse(event, kind="down")
+            if self._watched_widget is not None:
+                self._watched_widget.setFocus(Qt.FocusReason.MouseFocusReason)
+            self._handle_mouse(event, kind="press")
             return True
         if etype == QEvent.Type.MouseButtonRelease:
-            self._handle_mouse(event, kind="up")
+            self._handle_mouse(event, kind="release")
             return True
         if etype == QEvent.Type.Wheel:
             self._handle_wheel(event)
             return True
         if etype == QEvent.Type.KeyPress:
-            self._handle_key(event, kind="key_down")
+            self._handle_key(event, kind="key_press")
             return True
         if etype == QEvent.Type.KeyRelease:
-            self._handle_key(event, kind="key_up")
+            self._handle_key(event, kind="key_release")
             return True
         return False
 
@@ -245,42 +251,59 @@ class RemoteControlExecutor:
     def __init__(self) -> None:
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
         self._running = False
         self._screen_size: tuple[int, int] | None = None
         self._pyautogui = None
         self._error: str | None = None
 
     def start(self) -> tuple[bool, str | None]:
-        if self._running:
+        with self._lock:
+            if self._running:
+                return True, None
+            self._drain_queue()
+            try:
+                import pyautogui
+                # Disable the corner-of-screen fail-safe and the inter-call sleep:
+                # we already throttle on the viewer side and the fail-safe makes
+                # legitimate corner-of-screen moves abort the session.
+                pyautogui.FAILSAFE = False
+                pyautogui.PAUSE = 0
+                self._pyautogui = pyautogui
+                self._screen_size = pyautogui.size()
+            except BaseException as exc:
+                logger.exception("Failed to start remote control executor")
+                self._error = f"Remote control unavailable: {exc}"
+                return False, self._error
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._loop, name="remote-control-exec", daemon=True,
+            )
+            self._thread.start()
             return True, None
-        try:
-            import pyautogui
-            # Disable the corner-of-screen fail-safe and the inter-call sleep:
-            # we already throttle on the viewer side and the fail-safe makes
-            # legitimate corner-of-screen moves abort the session.
-            pyautogui.FAILSAFE = False
-            pyautogui.PAUSE = 0
-            self._pyautogui = pyautogui
-            self._screen_size = pyautogui.size()
-        except Exception as exc:
-            self._error = f"Remote control unavailable: {exc}"
-            return False, self._error
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._loop, name="remote-control-exec", daemon=True,
-        )
-        self._thread.start()
-        return True, None
 
     def stop(self) -> None:
-        self._running = False
-        # Push a sentinel to wake the thread.
-        self._queue.put(None)
+        with self._lock:
+            thread = self._thread
+            if not self._running and thread is None:
+                return
+            self._running = False
+            # Push a sentinel to wake the thread.
+            self._queue.put(None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
+            self._drain_queue()
 
     def submit(self, payload: dict) -> None:
         if not self._running:
             return
         self._queue.put(payload)
+
+    def is_running(self) -> bool:
+        return self._running
 
     def _loop(self) -> None:
         pg = self._pyautogui
@@ -290,7 +313,7 @@ class RemoteControlExecutor:
                 break
             try:
                 self._execute(pg, item)
-            except Exception:
+            except BaseException:
                 logger.exception("Failed to execute remote event")
 
     def _execute(self, pg, payload: dict) -> None:
@@ -298,27 +321,33 @@ class RemoteControlExecutor:
             return
         screen_w, screen_h = self._screen_size
         kind = payload.get("kind")
-        if kind in ("move", "down", "up", "scroll"):
+        if kind in ("move", "press", "release", "down", "up", "scroll"):
             nx = float(payload.get("x", 0.0))
             ny = float(payload.get("y", 0.0))
             px = max(0, min(screen_w - 1, int(nx * screen_w)))
             py = max(0, min(screen_h - 1, int(ny * screen_h)))
             if kind == "move":
                 pg.moveTo(px, py, duration=0)
-            elif kind == "down":
+            elif kind in ("press", "down"):
                 button = payload.get("button", "left")
                 pg.mouseDown(px, py, button=button)
-            elif kind == "up":
+            elif kind in ("release", "up"):
                 button = payload.get("button", "left")
                 pg.mouseUp(px, py, button=button)
             elif kind == "scroll":
-                pg.moveTo(px, py, duration=0)
-                pg.scroll(int(payload.get("amount", 0)))
-        elif kind == "key_down":
+                pg.scroll(int(payload.get("amount", 0)), x=px, y=py)
+        elif kind in ("key_press", "key_down"):
             key = payload.get("key")
             if key:
                 pg.keyDown(key)
-        elif kind == "key_up":
+        elif kind in ("key_release", "key_up"):
             key = payload.get("key")
             if key:
                 pg.keyUp(key)
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return

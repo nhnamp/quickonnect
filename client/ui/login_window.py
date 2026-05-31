@@ -80,6 +80,8 @@ class LoginWindow(QWidget):
         self._store = local_store
         self._lb_host = lb_host
         self._lb_port = lb_port
+        self._active_lb_host = lb_host
+        self._active_lb_port = lb_port
         self._worker: _AuthWorker | None = None
 
         self.setWindowTitle("QuicKonNect - Login")
@@ -166,6 +168,8 @@ class LoginWindow(QWidget):
     def _start_auth(self, action, username, password, token):
         lb_host = self._host_input.text().strip() or self._lb_host
         lb_port = int(self._port_input.text().strip() or self._lb_port)
+        self._active_lb_host = lb_host
+        self._active_lb_port = lb_port
 
         self._worker = _AuthWorker(lb_host, lb_port, self._conn, action, username, password, token)
         self._worker.finished.connect(self._on_auth_result)
@@ -177,6 +181,8 @@ class LoginWindow(QWidget):
             token = user_info.get("token", "")
             user_id = user_info.get("user_id", 0)
             username = user_info.get("username", "")
+            user_info["lb_host"] = self._active_lb_host
+            user_info["lb_port"] = self._active_lb_port
             if token:
                 self._store.save_session(token, user_id, username)
                 # Enable auto-reconnect with JWT token

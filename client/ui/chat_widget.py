@@ -32,6 +32,7 @@ _MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 class ChatWidget(QWidget):
     """Chat panel: room list on the left, message view + participant list on the right."""
     send_packet = pyqtSignal(int, dict)  # packet_type, payload
+    join_room_requested = pyqtSignal(str)  # regular room code entered via Join button
     room_changed = pyqtSignal(str)       # emitted when _current_room changes (Phase 2 hookup)
 
     def __init__(self):
@@ -176,7 +177,7 @@ class ChatWidget(QWidget):
     def _on_join_room(self):
         code, ok = QInputDialog.getText(self, "Join Room", "Enter room code:")
         if ok and code.strip():
-            self.send_packet.emit(PacketType.JOIN_ROOM, {"room_code": code.strip().upper()})
+            self.join_room_requested.emit(code.strip().upper())
 
     def _on_copy_code(self):
         if self._current_room:
