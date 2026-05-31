@@ -253,6 +253,9 @@ class ScreenShareWidget(QWidget):
             if not ok:
                 logger.warning("Audio engine failed to start: %s", error)
                 self._diag_label.setText(error or "Audio unavailable")
+            elif error:
+                logger.warning("Audio engine started with warning: %s", error)
+                self._diag_label.setText(error)
             else:
                 self._diag_label.setText("")
 

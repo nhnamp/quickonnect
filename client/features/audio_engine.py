@@ -105,6 +105,7 @@ class AudioEngine:
         self._output_rate = SAMPLE_RATE
         self._capture_chunk_size = CHUNK_SIZE
         self._playback_chunk_size = CHUNK_SIZE
+        self._input_error: str | None = None
         self._capture_resampler: _PcmResampler | None = None
         self._playback_resampler: _PcmResampler | None = None
         self._capture_sent = 0
@@ -126,6 +127,10 @@ class AudioEngine:
         """
         if self._running:
             return False, "Already running"
+
+        self._input_error = None
+        self._input_device_index = None
+        self._output_device_index = None
 
         try:
             import pyaudio  # noqa: F401
@@ -160,17 +165,23 @@ class AudioEngine:
             else None
         )
 
-        self._capture_thread = threading.Thread(
-            target=self._capture_loop, name="audio-capture", daemon=True,
-        )
+        self._capture_thread = None
+        if self._input_device_index is not None:
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop, name="audio-capture", daemon=True,
+            )
         self._playback_thread = threading.Thread(
             target=self._playback_loop, name="audio-playback", daemon=True,
         )
-        self._capture_thread.start()
+        if self._capture_thread is not None:
+            self._capture_thread.start()
         self._playback_thread.start()
 
-        logger.info("AudioEngine started for room %s", room_code)
-        return True, None
+        logger.info(
+            "AudioEngine started for room %s (capture=%s playback=true)",
+            room_code, self._capture_thread is not None,
+        )
+        return True, self._input_error
 
     def stop(self) -> None:
         """Stop both threads and release PyAudio resources."""
@@ -220,29 +231,41 @@ class AudioEngine:
         except Exception as exc:
             return False, f"PyAudio import failed: {exc}"
 
-        input_stream = None
         output_stream = None
+        input_stream = None
+        try:
+            output_stream, output_rate, output_index, output_name = self._open_best_stream(
+                pyaudio, is_input=False,
+            )
+            self._output_device_index = output_index
+            self._output_rate = output_rate
+            self._playback_chunk_size = self._frames_per_packet(output_rate)
+            logger.info(
+                "Audio output preflight succeeded: output=%s rate=%d",
+                output_name, output_rate,
+            )
+        except Exception as exc:
+            logger.error("Audio output preflight failed: %s", exc)
+            return False, f"Speaker unavailable: {exc}"
+
         try:
             input_stream, input_rate, input_index, input_name = self._open_best_stream(
                 pyaudio, is_input=True,
             )
-            output_stream, output_rate, output_index, output_name = self._open_best_stream(
-                pyaudio, is_input=False,
-            )
             self._input_device_index = input_index
-            self._output_device_index = output_index
             self._input_rate = input_rate
-            self._output_rate = output_rate
             self._capture_chunk_size = self._frames_per_packet(input_rate)
-            self._playback_chunk_size = self._frames_per_packet(output_rate)
+            self._input_error = None
             logger.info(
-                "Audio preflight succeeded: input=%s rate=%d output=%s rate=%d",
-                input_name, input_rate, output_name, output_rate,
+                "Audio input preflight succeeded: input=%s rate=%d",
+                input_name, input_rate,
             )
             return True, None
         except Exception as exc:
-            logger.error("Audio preflight failed: %s", exc)
-            return False, f"Microphone or speaker unavailable: {exc}"
+            self._input_device_index = None
+            self._input_error = f"Microphone unavailable: {exc}. You can hear others, but they cannot hear you."
+            logger.error("Audio input preflight failed: %s", exc)
+            return True, self._input_error
         finally:
             for stream in (input_stream, output_stream):
                 if stream is None:
@@ -336,10 +359,10 @@ class AudioEngine:
     def _candidate_rates(device_info: dict) -> list[int]:
         rates: list[int] = []
         for rate in (
-            SAMPLE_RATE,
             int(float(device_info.get("defaultSampleRate", SAMPLE_RATE) or SAMPLE_RATE)),
             48000,
             44100,
+            SAMPLE_RATE,
         ):
             if rate > 0 and rate not in rates:
                 rates.append(rate)
@@ -443,6 +466,9 @@ class AudioEngine:
             return
 
         stream = None
+        if self._input_device_index is None:
+            logger.warning("Capture thread not started: no usable microphone input device")
+            return
         try:
             stream = self._pa.open(
                 format=pyaudio.paInt16,

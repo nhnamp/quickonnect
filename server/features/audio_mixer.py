@@ -61,6 +61,9 @@ class AudioMixerState:
         self._buffers: dict[int, deque[bytes]] = {}
         # user_id -> username (needed for stt callback)
         self._usernames: dict[int, str] = {}
+        # Lightweight diagnostics for LAN audio debugging.
+        self._received_counts: dict[int, int] = {}
+        self._sent_counts: dict[int, int] = {}
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -75,6 +78,8 @@ class AudioMixerState:
             if user_id not in self._buffers:
                 self._buffers[user_id] = deque(maxlen=10)
                 self._usernames[user_id] = username
+                self._received_counts[user_id] = 0
+                self._sent_counts[user_id] = 0
                 logger.debug(
                     "Room %s: added audio participant %s (uid=%d)",
                     self._room_code, username, user_id,
@@ -89,6 +94,8 @@ class AudioMixerState:
         with self._lock:
             self._buffers.pop(user_id, None)
             self._usernames.pop(user_id, None)
+            self._received_counts.pop(user_id, None)
+            self._sent_counts.pop(user_id, None)
             if not self._buffers and self._running:
                 stop_needed = True
 
@@ -131,10 +138,20 @@ class AudioMixerState:
                 buf = self._buffers[user_id]
             username = self._usernames.get(user_id, "")
             buf.append(pcm)
+            count = self._received_counts.get(user_id, 0) + 1
+            self._received_counts[user_id] = count
             logger.debug(
                 "Room %s: queued audio uid=%d seq=%s buffer=%d",
                 self._room_code, user_id, seq, len(buf),
             )
+            if count % 100 == 0:
+                peak, rms = self._pcm_peak_rms(pcm)
+                logger.info(
+                    "Room %s: received %d audio frames uid=%d user=%s seq=%s "
+                    "buffer=%d peak=%d rms=%d",
+                    self._room_code, count, user_id, username, seq,
+                    len(buf), peak, rms,
+                )
 
         # Feed STT (outside lock to avoid holding it during potentially
         # expensive work in the callback).
@@ -226,6 +243,18 @@ class AudioMixerState:
                     "channels": CHANNELS,
                     "sample_width": SAMPLE_WIDTH,
                 })
+                with self._lock:
+                    count = self._sent_counts.get(recipient_uid, 0) + 1
+                    self._sent_counts[recipient_uid] = count
+                if count % 100 == 0:
+                    peak, rms = self._pcm_peak_rms(mixed)
+                    logger.info(
+                        "Room %s: sent %d mixed audio frames to uid=%d "
+                        "from_speakers=%s peak=%d rms=%d",
+                        self._room_code, count, recipient_uid,
+                        sorted(uid for uid in pulled if uid != recipient_uid),
+                        peak, rms,
+                    )
             except Exception:
                 logger.debug(
                     "Room %s: failed to send mixed audio to uid=%d",
@@ -271,3 +300,16 @@ class AudioMixerState:
                 mixed[i] = -32768
 
         return struct.pack(fmt, *mixed)
+
+    @staticmethod
+    def _pcm_peak_rms(pcm_data: bytes) -> tuple[int, int]:
+        """Return basic signal level diagnostics for mono int16 PCM."""
+        if len(pcm_data) < SAMPLE_WIDTH:
+            return 0, 0
+        if len(pcm_data) % SAMPLE_WIDTH:
+            pcm_data = pcm_data[:-1]
+        sample_count = len(pcm_data) // SAMPLE_WIDTH
+        samples = struct.unpack(f"<{sample_count}h", pcm_data)
+        peak = max(abs(sample) for sample in samples)
+        mean_square = sum(sample * sample for sample in samples) / sample_count
+        return peak, int(mean_square ** 0.5)

@@ -40,10 +40,14 @@ class TestAudioMixer(unittest.TestCase):
         self.assertTrue(self.mixer.has_participants())
         self.assertIn(1, self.mixer._buffers)
         self.assertEqual(self.mixer._usernames[1], "alice")
+        self.assertEqual(self.mixer._received_counts[1], 0)
+        self.assertEqual(self.mixer._sent_counts[1], 0)
 
         self.mixer.remove_participant(1)
         self.assertFalse(self.mixer.has_participants())
         self.assertNotIn(1, self.mixer._buffers)
+        self.assertNotIn(1, self.mixer._received_counts)
+        self.assertNotIn(1, self.mixer._sent_counts)
 
     def test_feed_audio_normalises_frame_size(self) -> None:
         # Create silent frames of different sizes
@@ -54,6 +58,7 @@ class TestAudioMixer(unittest.TestCase):
         # Short frame should be padded with zeros
         self.mixer.feed_audio(1, base64.b64encode(short_frame).decode("ascii"))
         self.stt_feed.assert_called_once()
+        self.assertEqual(self.mixer._received_counts[1], 1)
         fed_pcm = self.stt_feed.call_args[0][2]
         self.assertEqual(len(fed_pcm), FRAME_BYTES)
         self.assertTrue(fed_pcm.startswith(short_frame))
@@ -62,6 +67,7 @@ class TestAudioMixer(unittest.TestCase):
         # Long frame should be truncated
         self.stt_feed.reset_mock()
         self.mixer.feed_audio(1, base64.b64encode(long_frame).decode("ascii"))
+        self.assertEqual(self.mixer._received_counts[1], 2)
         fed_pcm = self.stt_feed.call_args[0][2]
         self.assertEqual(len(fed_pcm), FRAME_BYTES)
         self.assertEqual(fed_pcm, long_frame[:FRAME_BYTES])
@@ -69,6 +75,7 @@ class TestAudioMixer(unittest.TestCase):
         # Correct frame should stay as-is
         self.stt_feed.reset_mock()
         self.mixer.feed_audio(1, base64.b64encode(correct_frame).decode("ascii"))
+        self.assertEqual(self.mixer._received_counts[1], 3)
         fed_pcm = self.stt_feed.call_args[0][2]
         self.assertEqual(len(fed_pcm), FRAME_BYTES)
         self.assertEqual(fed_pcm, correct_frame)
@@ -157,6 +164,8 @@ class TestAudioMixer(unittest.TestCase):
         bob_mixed = base64.b64decode(payload["pcm_b64"])
         bob_mixed_samples = struct.unpack(alice_fmt, bob_mixed)
         self.assertEqual(list(bob_mixed_samples), alice_samples)
+        self.assertEqual(self.mixer._sent_counts[1], 1)
+        self.assertEqual(self.mixer._sent_counts[2], 1)
 
 
 if __name__ == "__main__":

@@ -15,10 +15,11 @@ def test_frames_per_packet_uses_20ms_window() -> None:
     assert AudioEngine._frames_per_packet(48000) == int(48000 * FRAME_DURATION_MS / 1000)
 
 
-def test_candidate_rates_prefers_network_rate_then_device_rate() -> None:
+def test_candidate_rates_prefers_device_rate_then_network_rate() -> None:
     rates = AudioEngine._candidate_rates({"defaultSampleRate": 48000.0})
 
-    assert rates[0] == SAMPLE_RATE
+    assert rates[0] == 48000
+    assert rates[-1] == SAMPLE_RATE
     assert 48000 in rates
     assert len(rates) == len(set(rates))
 
