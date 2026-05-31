@@ -95,14 +95,14 @@ class WhiteboardScene(QGraphicsScene):
             self._temp_item = QGraphicsRectItem()
             self._temp_item.setRect(self._start_pos.x(), self._start_pos.y(), 0, 0)
             self._temp_item.setPen(preview_pen)
-            self._temp_item.setBrush(Qt.BrushStyle.NoBrush)
+            self._temp_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             self.addItem(self._temp_item)
 
         elif self.active_tool == "oval":
             self._temp_item = QGraphicsEllipseItem()
             self._temp_item.setRect(self._start_pos.x(), self._start_pos.y(), 0, 0)
             self._temp_item.setPen(preview_pen)
-            self._temp_item.setBrush(Qt.BrushStyle.NoBrush)
+            self._temp_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             self.addItem(self._temp_item)
 
         super().mousePressEvent(event)
@@ -447,7 +447,7 @@ class WhiteboardWidget(QWidget):
             if len(r) == 4:
                 item = QGraphicsRectItem(r[0], r[1], r[2], r[3])
                 item.setPen(pen)
-                item.setBrush(Qt.BrushStyle.NoBrush)
+                item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                 self.scene.addItem(item)
 
         elif event_type == "oval":
@@ -455,7 +455,7 @@ class WhiteboardWidget(QWidget):
             if len(r) == 4:
                 item = QGraphicsEllipseItem(r[0], r[1], r[2], r[3])
                 item.setPen(pen)
-                item.setBrush(Qt.BrushStyle.NoBrush)
+                item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                 self.scene.addItem(item)
 
         elif event_type == "text":

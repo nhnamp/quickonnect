@@ -93,6 +93,12 @@ class AudioEngine:
             return
         self._running = False
 
+        # Let worker threads close their streams before terminating PyAudio.
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=1.5)
+        if self._playback_thread is not None:
+            self._playback_thread.join(timeout=1.5)
+
         if self._pa is not None:
             try:
                 self._pa.terminate()
@@ -108,6 +114,9 @@ class AudioEngine:
                 self._playback_queue.get_nowait()
             except queue.Empty:
                 break
+
+        self._capture_thread = None
+        self._playback_thread = None
 
         logger.info("AudioEngine stopped")
 

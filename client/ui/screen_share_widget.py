@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from shared.constants import PacketType
+from client.features import screen_engine
 from client.features.screen_engine import ScreenCaptureEngine, decode_jpeg
 from client.features.remote_control import RemoteControlSender, RemoteControlExecutor
 from client.features.audio_engine import AudioEngine
@@ -507,6 +508,21 @@ class ScreenShareWidget(QWidget):
         self._audio_engine.set_muted(muted)
         self._mute_btn.setText("\U0001F507 Unmute" if muted else "\U0001F3A4 Mute")
 
+    def _on_fps_changed(self, value: int) -> None:
+        fps = max(1, int(value))
+        self._fps_value.setText(str(fps))
+        screen_engine.SCREEN_CAPTURE_FPS = fps
+
+    def _on_quality_changed(self, value: int) -> None:
+        quality = max(1, int(value))
+        self._quality_value.setText(str(quality))
+        screen_engine.SCREEN_JPEG_QUALITY = quality
+
+    def _on_scale_changed(self, value: int) -> None:
+        scale_pct = max(1, int(value))
+        self._scale_value.setText(f"{scale_pct}%")
+        screen_engine.SCREEN_CAPTURE_SCALE = scale_pct / 100.0
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -563,6 +579,14 @@ class ScreenShareWidget(QWidget):
         }
         if not reason or reason in normal_reasons:
             return
+        logger.error("Screen sharing stopped unexpectedly: %s", reason)
+        if self._sharer_user_id == self._user_id:
+            self._send_screen_stop(self._room_code)
+        self._executor.stop()
+        self._clear_share_state()
+        self._frame_label.clear_frame()
+        self._refresh_controls()
+        QMessageBox.warning(self, "Screen Share", reason)
 
     def _on_frame_dropped(self, total: int) -> None:
         self._diag_label.setText(f"Dropped frames (queue full): {total}")
@@ -733,14 +757,6 @@ class ScreenShareWidget(QWidget):
         x = geom.x() + (geom.width() - sw) // 2
         y = geom.y() + geom.height() - sh - 16
         self._subtitle_widget.move(max(0, x), max(0, y))
-        logger.error("Screen sharing stopped unexpectedly: %s", reason)
-        if self._sharer_user_id == self._user_id:
-            self._send_screen_stop(self._room_code)
-        self._executor.stop()
-        self._clear_share_state()
-        self._frame_label.clear_frame()
-        self._refresh_controls()
-        QMessageBox.warning(self, "Screen Share", reason)
 
     def _on_local_frame_captured(self, image: QImage) -> None:
         if self._engine.is_running():
