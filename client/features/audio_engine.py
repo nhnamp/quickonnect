@@ -71,6 +71,15 @@ class AudioEngine:
             logger.error("Failed to initialise PyAudio: %s", exc)
             return False, f"Audio system unavailable: {exc}"
 
+        ok, error = self._preflight_streams()
+        if not ok:
+            try:
+                self._pa.terminate()
+            except Exception:
+                logger.debug("PyAudio terminate error after failed preflight (ignored)")
+            self._pa = None
+            return False, error
+
         self._room_code = room_code
         self._running = True
         self._seq = 0
@@ -119,6 +128,45 @@ class AudioEngine:
         self._playback_thread = None
 
         logger.info("AudioEngine stopped")
+
+    def _preflight_streams(self) -> tuple[bool, str | None]:
+        """Verify microphone and speaker streams can open before claiming success."""
+        try:
+            import pyaudio
+        except Exception as exc:
+            return False, f"PyAudio import failed: {exc}"
+
+        input_stream = None
+        output_stream = None
+        try:
+            input_stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE,
+            )
+            output_stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                output=True,
+                frames_per_buffer=CHUNK_SIZE,
+            )
+            logger.info("Audio preflight succeeded")
+            return True, None
+        except Exception as exc:
+            logger.error("Audio preflight failed: %s", exc)
+            return False, f"Microphone or speaker unavailable: {exc}"
+        finally:
+            for stream in (input_stream, output_stream):
+                if stream is None:
+                    continue
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    logger.debug("Error closing preflight audio stream (ignored)")
 
     # ------------------------------------------------------------------
     # Mute control (thread-safe)

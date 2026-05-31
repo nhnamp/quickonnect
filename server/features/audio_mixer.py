@@ -131,6 +131,10 @@ class AudioMixerState:
                 buf = self._buffers[user_id]
             username = self._usernames.get(user_id, "")
             buf.append(pcm)
+            logger.debug(
+                "Room %s: queued audio uid=%d seq=%s buffer=%d",
+                self._room_code, user_id, seq, len(buf),
+            )
 
         # Feed STT (outside lock to avoid holding it during potentially
         # expensive work in the callback).
@@ -230,7 +234,7 @@ class AudioMixerState:
 
     @staticmethod
     def _mix_frames(frames: list[bytes]) -> bytes:
-        """Sum PCM int16 frames with clipping to [-32768, 32767].
+        """Average PCM int16 frames with clipping to [-32768, 32767].
 
         Each frame is expected to be ``FRAME_BYTES`` bytes of signed
         little-endian 16-bit samples.
@@ -241,6 +245,7 @@ class AudioMixerState:
         num_samples = FRAME_SIZE
         fmt = f"<{num_samples}h"
         mixed = [0] * num_samples
+        valid_frames = 0
 
         for frame in frames:
             try:
@@ -248,8 +253,15 @@ class AudioMixerState:
             except struct.error:
                 # Frame is the wrong length — skip it
                 continue
+            valid_frames += 1
             for i in range(num_samples):
                 mixed[i] += samples[i]
+
+        if valid_frames == 0:
+            return b"\x00" * FRAME_BYTES
+
+        for i in range(num_samples):
+            mixed[i] = int(mixed[i] / valid_frames)
 
         # Clip to int16 range
         for i in range(num_samples):

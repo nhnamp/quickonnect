@@ -83,7 +83,7 @@ class TestAudioMixer(unittest.TestCase):
         mixed = AudioMixerState._mix_frames([frame])
         self.assertEqual(mixed, frame)
 
-    def test_mixing_frames_adds_samples(self) -> None:
+    def test_mixing_frames_averages_samples(self) -> None:
         # Create frames with distinct values
         fmt = f"<{FRAME_SIZE}h"
         samples1 = [10] * FRAME_SIZE
@@ -93,9 +93,9 @@ class TestAudioMixer(unittest.TestCase):
 
         mixed = AudioMixerState._mix_frames([frame1, frame2])
         mixed_samples = struct.unpack(fmt, mixed)
-        self.assertEqual(list(mixed_samples), [30] * FRAME_SIZE)
+        self.assertEqual(list(mixed_samples), [15] * FRAME_SIZE)
 
-    def test_mixing_frames_clips_samples(self) -> None:
+    def test_mixing_frames_normalises_loud_samples(self) -> None:
         fmt = f"<{FRAME_SIZE}h"
         samples1 = [30000] * FRAME_SIZE
         samples2 = [10000] * FRAME_SIZE
@@ -104,7 +104,7 @@ class TestAudioMixer(unittest.TestCase):
 
         mixed = AudioMixerState._mix_frames([frame1, frame2])
         mixed_samples = struct.unpack(fmt, mixed)
-        self.assertEqual(list(mixed_samples), [32767] * FRAME_SIZE)  # clipped to max int16
+        self.assertEqual(list(mixed_samples), [20000] * FRAME_SIZE)
 
         samples3 = [-30000] * FRAME_SIZE
         samples4 = [-10000] * FRAME_SIZE
@@ -113,7 +113,7 @@ class TestAudioMixer(unittest.TestCase):
 
         mixed_neg = AudioMixerState._mix_frames([frame3, frame4])
         mixed_neg_samples = struct.unpack(fmt, mixed_neg)
-        self.assertEqual(list(mixed_neg_samples), [-32768] * FRAME_SIZE)  # clipped to min int16
+        self.assertEqual(list(mixed_neg_samples), [-20000] * FRAME_SIZE)
 
     def test_mix_tick_sends_to_everyone_excluding_self(self) -> None:
         # Register two clients in get_clients

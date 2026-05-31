@@ -5,6 +5,7 @@ with drawing tools (pen, rect, oval, text, eraser), undo stack, and exports.
 """
 
 import logging
+from typing import Any
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF
 from PyQt6.QtGui import (
     QColor, QFont, QImage, QPainter, QPainterPath,
@@ -373,6 +374,23 @@ class WhiteboardWidget(QWidget):
         self._my_undone_seqs.clear()
         self._undo_to_redo_map.clear()
 
+    def replace_events(self, events: list[dict]) -> None:
+        """Replace visible items with a server-canonical event list.
+
+        This is used after undo/redo broadcasts. It preserves local undo/redo
+        stacks so the user's history controls keep working after the redraw.
+        """
+        self.scene.clear()
+        self._scene_items.clear()
+        for event in events:
+            seq_num = event.get("seq_num")
+            user_id = event.get("user_id", 0)
+            username = event.get("username", "")
+            event_type = event.get("event_type", "")
+            payload = event.get("payload", {})
+            if isinstance(seq_num, int) and isinstance(payload, dict):
+                self.apply_event(seq_num, user_id, username, event_type, payload)
+
     def record_own_draw(self, seq_num: int) -> None:
         """Record a successful seq_num drawn by the local user so they can undo it."""
         self._my_drawn_seqs.append(seq_num)
@@ -400,6 +418,10 @@ class WhiteboardWidget(QWidget):
         self, seq_num: int, user_id: int, username: str, event_type: str, payload: dict
     ) -> None:
         """Apply a validated server DRAW_BROADCAST to the canvas view."""
+        logger.debug(
+            "Applying whiteboard event seq=%s type=%s user=%s",
+            seq_num, event_type, username or user_id,
+        )
         # Clean up any existing item for this seq_num to be idempotent
         self.remove_item(seq_num)
 

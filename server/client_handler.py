@@ -16,6 +16,8 @@ from shared.crypto import (
 
 logger = logging.getLogger(__name__)
 
+_MAX_AUDIO_B64_LEN = 4096
+
 
 class ClientHandler(threading.Thread):
     """
@@ -644,16 +646,26 @@ class ClientHandler(threading.Thread):
     def _handle_audio_chunk(self, packet: Packet):
         room_code = packet.payload.get("room_code", "").strip()
         if not room_code or room_code not in self._current_rooms:
+            logger.debug("Ignoring audio from %s for non-joined room %s", self.username, room_code)
             return
         mixer = self._server.room_manager.get_audio_mixer(room_code)
         if mixer is None:
+            logger.debug("Ignoring audio from %s because room %s has no mixer", self.username, room_code)
             return
         # Lazily register this user as an audio participant
         mixer.add_participant(self.user_id, self.username)
         pcm_b64 = packet.payload.get("pcm_b64", "")
         seq = packet.payload.get("seq", 0)
-        if pcm_b64:
-            mixer.feed_audio(self.user_id, pcm_b64, seq)
+        if not isinstance(pcm_b64, str) or not pcm_b64:
+            return
+        if len(pcm_b64) > _MAX_AUDIO_B64_LEN:
+            logger.warning(
+                "Rejecting oversized audio frame from %s in room %s: %d bytes base64",
+                self.username, room_code, len(pcm_b64),
+            )
+            self.send(PacketType.ERROR, {"code": 413, "message": "Audio frame too large"})
+            return
+        mixer.feed_audio(self.user_id, pcm_b64, seq)
 
     # ------------------------------------------------------------------
     # Whiteboard
@@ -662,19 +674,29 @@ class ClientHandler(threading.Thread):
     def _handle_draw_event(self, packet: Packet):
         room_code = packet.payload.get("room_code", "").strip()
         if not room_code or room_code not in self._current_rooms:
+            logger.debug("Ignoring draw event from %s for non-joined room %s", self.username, room_code)
             return
         wb = self._server.room_manager.get_whiteboard_state(room_code)
         if wb is None:
+            logger.debug("Ignoring draw event from %s because room %s has no whiteboard", self.username, room_code)
             return
         
         event_type = packet.payload.get("event_type")
         payload = packet.payload.get("payload")
         client_event_id = packet.payload.get("client_event_id")
 
-        if not event_type or not isinstance(payload, dict):
+        if event_type not in {"pen", "eraser", "rect", "oval", "text", "undo"}:
+            self.send(PacketType.ERROR, {"code": 400, "message": "Invalid whiteboard event type"})
+            return
+        if not isinstance(payload, dict):
+            self.send(PacketType.ERROR, {"code": 400, "message": "Invalid whiteboard payload"})
             return
 
         seq = wb.add_event(self.user_id, event_type, payload, client_event_id)
+        logger.debug(
+            "Room %s: whiteboard event seq=%s type=%s user=%s client_event_id=%s",
+            room_code, seq, event_type, self.username, client_event_id,
+        )
 
         # Send ACK to the sender
         self.send(PacketType.DRAW_ACK, {
@@ -684,7 +706,7 @@ class ClientHandler(threading.Thread):
         })
 
         # Broadcast to all clients in the room
-        self._broadcast_to_room(room_code, PacketType.DRAW_BROADCAST, {
+        broadcast_payload = {
             "room_code": room_code,
             "seq_num": seq,
             "user_id": self.user_id,
@@ -692,7 +714,11 @@ class ClientHandler(threading.Thread):
             "event_type": event_type,
             "payload": payload,
             "client_event_id": client_event_id,
-        })
+        }
+        if event_type == "undo":
+            broadcast_payload["active_events"] = wb.get_active_events()
+
+        self._broadcast_to_room(room_code, PacketType.DRAW_BROADCAST, broadcast_payload)
 
     def _handle_export_request(self, packet: Packet):
         room_code = packet.payload.get("room_code", "").strip()

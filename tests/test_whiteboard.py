@@ -85,6 +85,18 @@ class TestWhiteboardState(unittest.TestCase):
         self.assertEqual(active[0]["seq_num"], 2)
         self.assertEqual(active[0]["event_type"], "oval")
 
+    def test_undo_the_undo_restores_event(self) -> None:
+        self.state.add_event(10, "rect", {"rect": [0, 0, 10, 10]})
+        undo_seq = self.state.add_event(10, "undo", {"target_seq": 1})
+        self.assertEqual(self.state.get_active_events(), [])
+
+        self.state.add_event(10, "undo", {"target_seq": undo_seq})
+
+        active = self.state.get_active_events()
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["seq_num"], 1)
+        self.assertEqual(active[0]["event_type"], "rect")
+
     def test_headless_rendering_png(self) -> None:
         # Load drawing events of all types
         self.state.add_event(10, "pen", {"points": [[50, 50], [100, 100]], "color": "#ffffff", "width": 4})

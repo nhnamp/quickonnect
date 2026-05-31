@@ -252,6 +252,9 @@ class ScreenShareWidget(QWidget):
             ok, error = self._audio_engine.start(room_code)
             if not ok:
                 logger.warning("Audio engine failed to start: %s", error)
+                self._diag_label.setText(error or "Audio unavailable")
+            else:
+                self._diag_label.setText("")
 
     def handle_room_state_screen(self, screen_info: dict | None) -> None:
         """Apply any active share carried by a ROOM_STATE payload."""
@@ -610,6 +613,7 @@ class ScreenShareWidget(QWidget):
         """Called when a local shape is completed on the whiteboard widget."""
         if not self._room_code:
             return
+        logger.debug("Sending whiteboard event type=%s room=%s", event_type, self._room_code)
         self._whiteboard_engine.send_draw_event(self._room_code, event_type, payload)
 
     def _on_local_export(self) -> None:
@@ -666,7 +670,15 @@ class ScreenShareWidget(QWidget):
         if seq_num is None:
             return
 
-        self._whiteboard_widget.apply_event(seq_num, user_id, username, event_type, data)
+        active_events = payload.get("active_events")
+        if event_type == "undo" and isinstance(active_events, list):
+            logger.debug(
+                "Applying canonical whiteboard state after undo seq=%s room=%s events=%d",
+                seq_num, self._room_code, len(active_events),
+            )
+            self._whiteboard_widget.replace_events(active_events)
+        else:
+            self._whiteboard_widget.apply_event(seq_num, user_id, username, event_type, data)
 
         # If we drew this shape and received confirmed broadcast, push to undo/redo history
         if user_id == self._user_id:
