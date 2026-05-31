@@ -9,7 +9,15 @@ import base64
 import logging
 import time
 
-from PyQt6.QtCore import QObject, QBuffer, QByteArray, QIODevice, pyqtSignal
+from PyQt6.QtCore import (
+    QObject,
+    QBuffer,
+    QByteArray,
+    QCoreApplication,
+    QIODevice,
+    Qt,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QImage
 
 from shared.constants import PacketType
@@ -26,6 +34,7 @@ CAMERA_MAX_HEIGHT = 270
 class CameraEngine(QObject):
     """Owns local camera capture and frame sending for one room."""
 
+    started = pyqtSignal(str)
     frame_captured = pyqtSignal(QImage)
     stopped = pyqtSignal(str)
 
@@ -39,11 +48,66 @@ class CameraEngine(QObject):
         self._video_sink = None
         self._last_sent = 0.0
         self._seq = 0
+        self._pending_room_code: str | None = None
 
     def is_running(self) -> bool:
         return self._running
 
     def start(self, room_code: str) -> tuple[bool, str | None]:
+        if self._running:
+            return False, "Camera is already on"
+        if self._pending_room_code is not None:
+            return False, "Camera permission request is already pending"
+
+        permission_ok, permission_error = self._ensure_camera_permission(room_code)
+        if not permission_ok:
+            return False, permission_error
+        if self._pending_room_code is not None:
+            return True, "Camera permission requested. Approve the macOS camera prompt to start video."
+
+        return self._start_after_permission(room_code)
+
+    def _ensure_camera_permission(self, room_code: str) -> tuple[bool, str | None]:
+        """Request camera permission when the platform requires it."""
+        try:
+            from PyQt6.QtCore import QCameraPermission
+        except Exception:
+            return True, None
+
+        app = QCoreApplication.instance()
+        if app is None:
+            return False, "Camera unavailable: Qt application is not running"
+
+        permission = QCameraPermission()
+        status = app.checkPermission(permission)
+        if status == Qt.PermissionStatus.Granted:
+            return True, None
+        if status == Qt.PermissionStatus.Denied:
+            return False, _camera_permission_denied_message()
+
+        self._pending_room_code = room_code
+        logger.info("Requesting camera permission")
+        app.requestPermission(permission, self._on_camera_permission_result)
+        return True, None
+
+    def _on_camera_permission_result(self, permission) -> None:
+        room_code = self._pending_room_code
+        self._pending_room_code = None
+        if room_code is None:
+            return
+
+        app = QCoreApplication.instance()
+        status = app.checkPermission(permission) if app is not None else Qt.PermissionStatus.Denied
+        if status != Qt.PermissionStatus.Granted:
+            logger.warning("Camera permission was not granted: %s", status)
+            self.stopped.emit(_camera_permission_denied_message())
+            return
+
+        ok, error = self._start_after_permission(room_code)
+        if not ok:
+            self.stopped.emit(error or "Could not start camera")
+
+    def _start_after_permission(self, room_code: str) -> tuple[bool, str | None]:
         if self._running:
             return False, "Camera is already on"
 
@@ -74,9 +138,14 @@ class CameraEngine(QObject):
 
         logger.info("Starting camera device: %s", device.description())
         self._camera.start()
+        self.started.emit(device.description())
         return True, None
 
     def stop(self, reason: str = "") -> None:
+        if self._pending_room_code is not None:
+            self._pending_room_code = None
+            self.stopped.emit(reason)
+            return
         if not self._running and self._camera is None:
             return
         self._running = False
@@ -181,3 +250,11 @@ def decode_camera_jpeg(jpeg_b64: str) -> QImage | None:
     if not image.loadFromData(QByteArray(raw), "JPG"):
         return None
     return image
+
+
+def _camera_permission_denied_message() -> str:
+    return (
+        "Camera access was denied. On macOS, allow camera access for this app "
+        "or for the terminal/Python launcher in System Settings > Privacy & "
+        "Security > Camera, then try again."
+    )

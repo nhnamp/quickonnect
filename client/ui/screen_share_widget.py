@@ -152,6 +152,7 @@ class ScreenShareWidget(QWidget):
 
         self._audio_engine = AudioEngine(connection_manager)
         self._camera_engine = CameraEngine(connection_manager, self)
+        self._camera_engine.started.connect(self._on_camera_engine_started)
         self._camera_engine.frame_captured.connect(self._on_local_camera_frame)
         self._camera_engine.stopped.connect(self._on_camera_engine_stopped)
         self._camera_tiles: dict[int, CameraTile] = {}
@@ -668,14 +669,13 @@ class ScreenShareWidget(QWidget):
             QMessageBox.warning(self, "Camera", error or "Could not start camera.")
             self._set_camera_button_checked(False)
             return
-        self.send_packet.emit(int(PacketType.CAMERA_START), {"room_code": self._room_code})
-        self._ensure_camera_tile(self._user_id, self._username)
         self._set_camera_button_checked(True)
+        if error:
+            self._diag_label.setText(error)
 
     def _stop_local_camera(self, reason: str, *, notify: bool) -> None:
         room_code = self._room_code
-        if self._camera_engine.is_running():
-            self._camera_engine.stop(reason)
+        self._camera_engine.stop(reason)
         if notify:
             self._send_camera_stop(room_code)
         self._remove_camera_tile(self._user_id)
@@ -712,6 +712,15 @@ class ScreenShareWidget(QWidget):
 
     def _on_local_camera_frame(self, image: QImage) -> None:
         self._ensure_camera_tile(self._user_id, self._username).set_frame(image)
+
+    def _on_camera_engine_started(self, device_name: str) -> None:
+        logger.info("Camera engine started with device: %s", device_name)
+        if self._room_code:
+            self.send_packet.emit(int(PacketType.CAMERA_START), {"room_code": self._room_code})
+        self._ensure_camera_tile(self._user_id, self._username)
+        self._set_camera_button_checked(True)
+        if self._diag_label.text().startswith("Camera permission requested"):
+            self._diag_label.setText("")
 
     def _on_camera_engine_stopped(self, reason: str) -> None:
         normal_reasons = {
