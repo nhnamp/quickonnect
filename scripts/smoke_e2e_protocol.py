@@ -43,9 +43,6 @@ def main() -> int:
         alice.send_message(room_code, attachment_content, "file")
         bob.expect_message_type(room_code, "file", timeout=5)
 
-        alice.send_draw(room_code)
-        bob.expect_packet(PacketType.DRAW_BROADCAST, lambda p: p.get("room_code") == room_code, timeout=5)
-
         alice.send_audio(room_code)
         bob.expect_packet(PacketType.MIXED_AUDIO, lambda p: p.get("room_code") == room_code, timeout=5)
 
@@ -80,7 +77,6 @@ class SmokeClient:
         self.conn.send(PacketType.JOIN_ROOM, {"room_code": room_code})
         self.expect_packet(PacketType.ROOM_STATE, lambda p: p.get("room_code") == room_code, timeout=10)
         self.expect_packet(PacketType.MESSAGE_HISTORY, lambda p: p.get("room_code") == room_code, timeout=10)
-        self.expect_packet(PacketType.WHITEBOARD_SYNC, lambda p: p.get("room_code") == room_code, timeout=10)
 
     def send_chat(self, room_code: str, text: str) -> None:
         self.send_message(room_code, text, "text")
@@ -90,18 +86,6 @@ class SmokeClient:
             "room_code": room_code,
             "content": content,
             "msg_type": msg_type,
-        })
-
-    def send_draw(self, room_code: str) -> None:
-        self.conn.send(PacketType.DRAW_EVENT, {
-            "room_code": room_code,
-            "client_seq_num": 1,
-            "event_type": "STROKE",
-            "payload": {
-                "points": [{"x": 5, "y": 5}, {"x": 30, "y": 35}],
-                "color": "#112233",
-                "width": 4,
-            },
         })
 
     def send_audio(self, room_code: str) -> None:

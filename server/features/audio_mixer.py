@@ -1,4 +1,4 @@
-"""Server-side audio mixing and optional subtitle transcription.
+"""Server-side audio mixing and bilingual subtitle transcription.
 
 The mixer receives 20 ms PCM frames from each participant in a room, keeps a
 small jitter buffer per sender, and emits one mixed frame per recipient. Each
@@ -165,27 +165,28 @@ def mix_pcm16(frames: list[bytes]) -> bytes:
 
 
 class SubtitleWorker:
-    """Optional local Whisper worker.
+    """Local Whisper worker for room subtitles.
 
-    Set QUICKONNECT_STT_ENABLED=1 to enable. If faster-whisper is unavailable,
-    the audio path still works and subtitles are simply disabled.
+    Subtitles are enabled by default for demo use. Set QUICKONNECT_STT_ENABLED=0
+    to disable them. If faster-whisper is unavailable, the audio path still
+    works and subtitles are simply disabled.
     """
 
     def __init__(self, room_code: str, get_clients: Callable[[str], dict[int, object]]):
         self._room_code = room_code
         self._get_clients = get_clients
-        self._enabled = os.environ.get("QUICKONNECT_STT_ENABLED", "0") == "1"
+        self._enabled = os.environ.get("QUICKONNECT_STT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
         self._model_name = os.environ.get("QUICKONNECT_STT_MODEL", "tiny")
         self._language = os.environ.get("QUICKONNECT_STT_LANGUAGE", "")
-        self._task = os.environ.get("QUICKONNECT_STT_TASK", "transcribe").strip().lower()
+        self._task = os.environ.get("QUICKONNECT_STT_TASK", "bilingual").strip().lower()
         if self._task not in {"transcribe", "translate", "bilingual"}:
-            logger.warning("Invalid QUICKONNECT_STT_TASK=%s; falling back to transcribe", self._task)
-            self._task = "transcribe"
-        self._window_seconds = _env_float("QUICKONNECT_STT_WINDOW_SECONDS", 5.0, minimum=1.0)
+            logger.warning("Invalid QUICKONNECT_STT_TASK=%s; falling back to bilingual", self._task)
+            self._task = "bilingual"
+        self._window_seconds = _env_float("QUICKONNECT_STT_WINDOW_SECONDS", 4.0, minimum=1.0)
         self._beam_size = _env_int("QUICKONNECT_STT_BEAM_SIZE", 5, minimum=1)
         self._vad_filter = os.environ.get("QUICKONNECT_STT_VAD_FILTER", "1") != "0"
-        self._min_rms = _env_float("QUICKONNECT_STT_MIN_RMS", 0.008, minimum=0.0)
-        self._min_peak = _env_float("QUICKONNECT_STT_MIN_PEAK", 0.03, minimum=0.0)
+        self._min_rms = _env_float("QUICKONNECT_STT_MIN_RMS", 0.003, minimum=0.0)
+        self._min_peak = _env_float("QUICKONNECT_STT_MIN_PEAK", 0.010, minimum=0.0)
         self._initial_prompt = os.environ.get(
             "QUICKONNECT_STT_INITIAL_PROMPT",
             "",
@@ -262,8 +263,15 @@ class SubtitleWorker:
                 samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
                 rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
                 peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                logger.info(
+                    "Subtitle window room=%s speaker=%s rms=%.4f peak=%.4f",
+                    self._room_code,
+                    username,
+                    rms,
+                    peak,
+                )
                 if rms < self._min_rms or peak < self._min_peak:
-                    logger.debug(
+                    logger.info(
                         "Skipping quiet subtitle window room=%s speaker=%s rms=%.4f peak=%.4f",
                         self._room_code,
                         username,
@@ -276,6 +284,7 @@ class SubtitleWorker:
                 else:
                     subtitle = self._transcribe_single(samples, self._task)
                 if not subtitle or not subtitle["text"]:
+                    logger.info("Subtitle produced no text room=%s speaker=%s", self._room_code, username)
                     continue
                 logger.info(
                     "Subtitle transcript room=%s speaker=%s language=%s task=%s text=%r translation=%r",

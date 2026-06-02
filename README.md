@@ -2,7 +2,7 @@
 
 QuicKonNect is a desktop video-call and messaging project for the Introduction to Network Programming course (NT106) at UIT, contributed by @nhnamp, @ComGa999ms, and @Qusy64.
 
-The project demonstrates a self-built TCP client/server system with multiple chat servers, a custom load balancer, PostgreSQL persistence, Redis coordination, encrypted transport, multi-client rooms, screen sharing, remote control, audio streaming, file/image messaging, and a collaborative whiteboard.
+The project demonstrates a self-built TCP client/server system with multiple chat servers, a custom load balancer, PostgreSQL persistence, Redis coordination, encrypted transport, multi-client rooms, audio streaming, live subtitles, and file/image messaging.
 
 ## Features
 
@@ -11,11 +11,8 @@ The project demonstrates a self-built TCP client/server system with multiple cha
 - Room chat and direct messages.
 - File and image messages over the custom TCP protocol.
 - Room-aware load balancing across two chat servers.
-- Screen sharing with one active sharer per room.
-- Remote control request, grant, revoke, and input relay.
 - Audio streaming with server-side per-room mixing.
-- Optional local Whisper subtitles.
-- Collaborative whiteboard with draw events, server ordering, persistence, sync for late joiners, undo, clear, and PNG export.
+- Local Whisper subtitles with bilingual English/Vietnamese display enabled by default.
 
 ## Architecture
 
@@ -99,8 +96,7 @@ $env:DB_PORT = "55432"
 Verified locally:
 
 ```text
-47 passed
-Protocol E2E smoke test passed.
+44 passed
 ```
 
 ## Manual Demo Checklist
@@ -111,15 +107,12 @@ Use [docs/11_e2e_test_preparation.md](docs/11_e2e_test_preparation.md) for a ful
 - Create/join room.
 - Text chat.
 - File/image messages.
-- Screen sharing.
-- Remote control.
 - Audio.
-- Whiteboard.
 - Multi-server behavior.
 
 ## Important Notes
 
 - Audio currently uses raw PCM for reliable LAN testing. It is heavier than Opus but simpler to install and debug.
-- Subtitles require `faster-whisper` and are disabled by default. Enable with `QUICKONNECT_STT_ENABLED=1`.
+- Subtitles require `faster-whisper` and run in bilingual mode by default. Disable with `QUICKONNECT_STT_ENABLED=0` if you only want audio.
 - If your local PostgreSQL on `5432` already belongs to another project, keep using `DB_PORT=55432` for QuicKonNect tests.
 - `AGENTS.md` and [CLAUDE.md](CLAUDE.md) describe project-specific development rules and documentation expectations.

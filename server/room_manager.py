@@ -6,8 +6,6 @@ import random
 from shared.models import Room, Participant, RoomState
 from server.services.db import get_connection
 from server.features.audio_mixer import AudioRoomState
-from server.features.screen_relay import ScreenRelayState
-from server.features.whiteboard import WhiteboardState
 
 logger = logging.getLogger(__name__)
 
@@ -57,23 +55,11 @@ class RoomManager:
         self._register_room_in_redis(room_code)
         return room
 
-    def get_screen_state(self, room_code: str) -> ScreenRelayState | None:
-        """Return the per-room ScreenRelayState, or None if the room is not active here."""
-        with self._lock:
-            room_data = self._rooms.get(room_code)
-            return room_data["screen"] if room_data else None
-
     def get_audio_state(self, room_code: str) -> AudioRoomState | None:
         """Return the per-room AudioRoomState, or None if the room is not active here."""
         with self._lock:
             room_data = self._rooms.get(room_code)
             return room_data["audio"] if room_data else None
-
-    def get_whiteboard_state(self, room_code: str) -> WhiteboardState | None:
-        """Return the per-room WhiteboardState, or None if the room is not active here."""
-        with self._lock:
-            room_data = self._rooms.get(room_code)
-            return room_data["whiteboard"] if room_data else None
 
     def join_room(self, room_code: str, user_id: int, username: str, client_handler) -> tuple[RoomState | None, str | None]:
         """
@@ -103,9 +89,7 @@ class RoomManager:
                 self._rooms[room_code] = {
                     "room": room,
                     "clients": {},
-                    "screen": ScreenRelayState(),
                     "audio": AudioRoomState(room_code, self.get_room_clients),
-                    "whiteboard": WhiteboardState(room.id, room_code),
                 }
                 if not dm:
                     self._register_room_in_redis(room_code)

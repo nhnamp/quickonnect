@@ -120,7 +120,7 @@ Schema created successfully.
 psql -U quickonnect -d quickonnect -c "\dt"
 ```
 
-You should see 7 tables: `users`, `sessions`, `friendships`, `rooms`, `room_participants`, `messages`, `whiteboard_events`.
+You should see 6 tables: `users`, `sessions`, `friendships`, `rooms`, `room_participants`, `messages`.
 
 ### 3.2 Redis
 

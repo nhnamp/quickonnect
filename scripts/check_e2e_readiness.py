@@ -30,8 +30,6 @@ REQUIRED_MODULES = {
     "psycopg_pool": "psycopg_pool",
     "redis": "redis",
     "PyQt6": "PyQt6",
-    "mss": "mss",
-    "pyautogui": "pyautogui",
     "pyaudio": "pyaudio",
 }
 
@@ -46,9 +44,7 @@ REQUIRED_FILES = [
     "scripts/setup_db.py",
     "docker-compose.yml",
     "server/features/audio_mixer.py",
-    "server/features/whiteboard.py",
     "client/ui/audio_widget.py",
-    "client/ui/whiteboard_widget.py",
 ]
 
 
@@ -111,10 +107,12 @@ def _module_check(label: str, module_name: str, required: bool) -> CheckResult:
 
 def check_environment() -> list[CheckResult]:
     data_dir = os.environ.get("QUICKONNECT_DATA", "~/.quickonnect")
-    stt_enabled = os.environ.get("QUICKONNECT_STT_ENABLED", "0")
+    stt_enabled = os.environ.get("QUICKONNECT_STT_ENABLED", "1")
+    stt_task = os.environ.get("QUICKONNECT_STT_TASK", "bilingual")
     return [
         CheckResult("QUICKONNECT_DATA", True, data_dir, required=False),
         CheckResult("QUICKONNECT_STT_ENABLED", True, stt_enabled, required=False),
+        CheckResult("QUICKONNECT_STT_TASK", True, stt_task, required=False),
     ]
 
 

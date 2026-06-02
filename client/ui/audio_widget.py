@@ -67,7 +67,7 @@ class AudioWidget(QWidget):
         layout.addWidget(self._subtitle_list, stretch=1)
 
         self._hint_label = QLabel(
-            "Subtitles appear when the server is started with QUICKONNECT_STT_ENABLED=1."
+            "Subtitles are enabled by default when the server has Whisper available."
         )
         self._hint_label.setStyleSheet("color: #777;")
         self._hint_label.setWordWrap(True)
