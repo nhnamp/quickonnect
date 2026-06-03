@@ -10,8 +10,6 @@ import psycopg
 
 SCHEMA_SQL = """
 -- Drop existing types and tables for clean setup
-DROP TABLE IF EXISTS whiteboard_snapshots CASCADE;
-DROP TABLE IF EXISTS whiteboard_events CASCADE;
 DROP TABLE IF EXISTS messages CASCADE;
 DROP TABLE IF EXISTS room_participants CASCADE;
 DROP TABLE IF EXISTS rooms CASCADE;
@@ -53,7 +51,7 @@ CREATE TABLE friendships (
     PRIMARY KEY (user_id, friend_id)
 );
 
--- Rooms (video call / chat rooms)
+-- Rooms (chat / audio rooms)
 CREATE TABLE rooms (
     id            SERIAL PRIMARY KEY,
     room_code     VARCHAR(20) UNIQUE NOT NULL,
@@ -80,26 +78,6 @@ CREATE TABLE messages (
     sent_at       TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_messages_room_id ON messages(room_id, sent_at);
-
--- Whiteboard events (for Phase 4)
-CREATE TABLE whiteboard_events (
-    id            BIGSERIAL PRIMARY KEY,
-    room_id       INT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    user_id       INT NOT NULL REFERENCES users(id),
-    seq_num       INT NOT NULL,
-    event_type    VARCHAR(30) NOT NULL,
-    payload       JSONB NOT NULL,
-    created_at    TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_whiteboard_room_seq ON whiteboard_events(room_id, seq_num);
-
--- Whiteboard snapshots (for Phase 4 periodic snapshots)
-CREATE TABLE whiteboard_snapshots (
-    room_id       INT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
-    last_seq      INT NOT NULL,
-    snapshot_png  BYTEA NOT NULL,
-    created_at    TIMESTAMPTZ DEFAULT NOW()
-);
 """
 
 
