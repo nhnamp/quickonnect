@@ -68,7 +68,15 @@ class SubtitleBroadcaster:
         target_lang = self._target_lang
 
         if self._translate_url and self._target_lang:
-            translated_text, source_lang = self._translate(text)
+            translated_text, source_lang = self._translate(text, self._target_lang)
+            if source_lang in {"en", "vi"} and source_lang == self._target_lang:
+                target_lang = "en" if source_lang == "vi" else "vi"
+                translated_text, _detected = self._translate(text, target_lang)
+        lines = []
+        if text:
+            lines.append({"lang": source_lang, "text": text})
+        if translated_text:
+            lines.append({"lang": target_lang, "text": translated_text})
 
         payload = {
             "room_code": self._room_code,
@@ -78,6 +86,7 @@ class SubtitleBroadcaster:
             "translated_text": translated_text,
             "source_lang": source_lang,
             "target_lang": target_lang,
+            "lines": lines,
         }
 
         clients = self._get_clients()
@@ -94,7 +103,7 @@ class SubtitleBroadcaster:
     # Translation
     # ------------------------------------------------------------------
 
-    def _translate(self, text: str) -> tuple[str, str]:
+    def _translate(self, text: str, target_lang: str) -> tuple[str, str]:
         """Translate *text* via LibreTranslate.
 
         Returns ``(translated_text, detected_source_lang)``.  On any
@@ -107,6 +116,7 @@ class SubtitleBroadcaster:
             "source": "auto",
             "target": self._target_lang,
             "format": "text",
+            "target": target_lang,
         }).encode("utf-8")
 
         req = urllib.request.Request(

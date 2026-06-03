@@ -54,7 +54,7 @@ def get_tunnel_url(api_port: int = 4040, timeout: int = 15) -> str | None:
 
 def main():
     parser = argparse.ArgumentParser(description="QuicKonNect Ngrok Tunnel Setup")
-    parser.add_argument("--port", type=int, default=9000, help="Local port to tunnel (default: 9000)")
+    parser.add_argument("--port", type=int, default=9001, help="Local chat server port to tunnel (default: 9001)")
     parser.add_argument("--ngrok-path", default=None, help="Path to ngrok binary")
     parser.add_argument("--region", default="us", help="Ngrok region (default: us)")
     args = parser.parse_args()
@@ -66,7 +66,7 @@ def main():
         sys.exit(1)
 
     logger.info("Using ngrok at: %s", ngrok_bin)
-    logger.info("Tunneling local port %d...", args.port)
+    logger.info("Tunneling local chat server port %d...", args.port)
 
     proc = subprocess.Popen(
         [ngrok_bin, "tcp", str(args.port), "--region", args.region],
@@ -107,7 +107,8 @@ def main():
     logger.info("  Public Address: %s", tunnel_url)
     logger.info("")
     logger.info("  For remote clients:")
-    logger.info("    python -m client.main --host %s --port %d", ngrok_host, ngrok_port)
+    logger.info("    python -m client.main --direct-server --host %s --port %d", ngrok_host, ngrok_port)
+    logger.info("    # or: LB_HOST=%s LB_PORT=%d QUICKONNECT_DIRECT_SERVER=1 python -m client.main", ngrok_host, ngrok_port)
     logger.info("")
     logger.info("  Press Ctrl+C to stop the tunnel")
     logger.info("=" * 60)
