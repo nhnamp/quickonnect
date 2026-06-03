@@ -34,6 +34,7 @@ from client.ui.chat_widget import ChatWidget
 from client.ui.friend_list_widget import FriendListWidget
 from client.ui.screen_share_widget import ScreenShareWidget
 from client.ui.audio_widget import AudioWidget
+from client.features.audio_engine import AudioEngine
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ class MainWindow(QMainWindow):
         self._lb_host = user_info.get("lb_host", "127.0.0.1")
         self._lb_port = int(user_info.get("lb_port", 9000))
         self._join_worker: _JoinRoomWorker | None = None
+        self._audio_engine = AudioEngine(self._conn)
 
         # E2E encryption keypair
         self._e2e_private_key = None
@@ -214,7 +216,12 @@ class MainWindow(QMainWindow):
         self._screen_widget.send_packet.connect(self._send_packet)
         self._chat_widget.room_changed.connect(self._screen_widget.set_current_room)
         
-        self._audio_widget = AudioWidget(self._conn, self._user_id, self._username)
+        self._audio_widget = AudioWidget(
+            self._conn,
+            self._user_id,
+            self._username,
+            audio_engine=self._audio_engine,
+        )
         self._audio_widget.send_packet.connect(self._send_packet)
         self._chat_widget.room_changed.connect(self._audio_widget.set_current_room)
 
@@ -341,11 +348,9 @@ class MainWindow(QMainWindow):
             self._screen_widget.on_remote_event(data)
 
         elif ptype == PacketType.MIXED_AUDIO:
-            self._screen_widget.on_mixed_audio(data)
             self._audio_widget.on_mixed_audio(data)
 
         elif ptype == PacketType.SUBTITLE:
-            self._screen_widget.on_subtitle(data)
             self._audio_widget.on_subtitle(data)
 
         elif ptype == PacketType.DRAW_BROADCAST:

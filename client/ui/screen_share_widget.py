@@ -26,10 +26,8 @@ from shared.constants import PacketType
 from client.features import screen_engine
 from client.features.screen_engine import ScreenCaptureEngine, decode_jpeg
 from client.features.remote_control import RemoteControlSender, RemoteControlExecutor
-from client.features.audio_engine import AudioEngine
 from client.features.camera_engine import CameraEngine, decode_camera_jpeg
 from client.features.whiteboard_engine import WhiteboardEngine
-from client.ui.subtitle_widget import SubtitleWidget
 from client.ui.whiteboard_widget import WhiteboardWidget
 
 logger = logging.getLogger(__name__)
@@ -64,14 +62,6 @@ class FrameLabel(QLabel):
 
     def resizeEvent(self, event):  # noqa: N802
         self._refresh_pixmap()
-        # Reposition subtitle overlay (if present as child widget)
-        for child in self.children():
-            if hasattr(child, 'show_subtitle'):  # duck-type check for SubtitleWidget
-                cw = child.width()
-                ch = child.sizeHint().height()
-                x = (self.width() - cw) // 2
-                y = self.height() - ch - 12
-                child.move(max(0, x), max(0, y))
         super().resizeEvent(event)
 
     def _refresh_pixmap(self) -> None:
@@ -150,7 +140,6 @@ class ScreenShareWidget(QWidget):
             self,
         )
 
-        self._audio_engine = AudioEngine(connection_manager)
         self._camera_engine = CameraEngine(connection_manager, self)
         self._camera_engine.started.connect(self._on_camera_engine_started)
         self._camera_engine.frame_captured.connect(self._on_local_camera_frame)
@@ -191,7 +180,7 @@ class ScreenShareWidget(QWidget):
         self._camera_strip.hide()
         layout.addWidget(self._camera_strip)
 
-        # Controls row 1: share / stop / request control / revoke + audio mute
+        # Controls row 1: share / stop / request control / revoke + camera
         btn_row = QHBoxLayout()
         self._share_btn = QPushButton("Share Screen")
         self._share_btn.clicked.connect(self._on_share_clicked)
@@ -207,14 +196,6 @@ class ScreenShareWidget(QWidget):
         self._revoke_btn = QPushButton("Revoke Control")
         self._revoke_btn.clicked.connect(self._on_revoke_clicked)
 
-        self._mute_btn = QPushButton("\U0001F3A4 Mute")
-        self._mute_btn.setCheckable(True)
-        self._mute_btn.setStyleSheet(
-            "QPushButton { padding: 4px 12px; }"
-            "QPushButton:checked { background-color: #c0392b; color: white; }"
-        )
-        self._mute_btn.clicked.connect(self._on_mute_toggled)
-
         self._camera_btn = QPushButton("Camera On")
         self._camera_btn.setCheckable(True)
         self._camera_btn.setStyleSheet(
@@ -226,7 +207,6 @@ class ScreenShareWidget(QWidget):
         btn_row.addWidget(self._share_btn)
         btn_row.addWidget(self._stop_btn)
         btn_row.addWidget(self._whiteboard_btn)
-        btn_row.addWidget(self._mute_btn)
         btn_row.addWidget(self._camera_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._request_btn)
@@ -273,11 +253,6 @@ class ScreenShareWidget(QWidget):
         self._diag_label.setStyleSheet("color: #888;")
         layout.addWidget(self._diag_label)
 
-        # Subtitle overlay (positioned manually on top of the stacked view)
-        self._subtitle_widget = SubtitleWidget(self._stacked_view)
-        self._subtitle_widget.setFixedWidth(600)
-        self._subtitle_widget.hide()
-
     # ------------------------------------------------------------------
     # External entry points (called by main_window)
     # ------------------------------------------------------------------
@@ -296,8 +271,6 @@ class ScreenShareWidget(QWidget):
             old_room = self._room_code
             self._camera_engine.stop("Switched room")
             self._send_camera_stop(old_room)
-        # Stop audio in the old room
-        self._audio_engine.stop()
         self._clear_camera_tiles()
         self._set_camera_button_checked(False)
         self._whiteboard_widget.clear_all()
@@ -306,17 +279,6 @@ class ScreenShareWidget(QWidget):
         self._room_code = room_code
         self._clear_share_state()
         self._refresh_controls()
-        # Start audio in the new room (if we have one)
-        if room_code:
-            ok, error = self._audio_engine.start(room_code)
-            if not ok:
-                logger.warning("Audio engine failed to start: %s", error)
-                self._diag_label.setText(error or "Audio unavailable")
-            elif error:
-                logger.warning("Audio engine started with warning: %s", error)
-                self._diag_label.setText(error)
-            else:
-                self._diag_label.setText("")
 
     def handle_room_state_cameras(self, cameras: list) -> None:
         """Apply active camera users carried by a ROOM_STATE payload."""
@@ -451,14 +413,6 @@ class ScreenShareWidget(QWidget):
             return
         self._executor.submit(payload)
 
-    def on_mixed_audio(self, payload: dict) -> None:
-        """Handle incoming MIXED_AUDIO packet — feed to playback."""
-        if payload.get("room_code") != self._room_code:
-            return
-        pcm_b64 = payload.get("pcm_b64", "")
-        if pcm_b64:
-            self._audio_engine.feed_playback(pcm_b64)
-
     def on_camera_start(self, payload: dict) -> None:
         if payload.get("room_code") != self._room_code:
             return
@@ -496,26 +450,13 @@ class ScreenShareWidget(QWidget):
         username = payload.get("username", "") or f"User {user_id}"
         self._ensure_camera_tile(int(user_id), username).set_frame(image)
 
-    def on_subtitle(self, payload: dict) -> None:
-        """Handle incoming SUBTITLE packet — show subtitle overlay."""
-        if payload.get("room_code") != self._room_code:
-            return
-        speaker = payload.get("speaker_username", "")
-        text = payload.get("text", "")
-        translated = payload.get("translated_text", "")
-        if text:
-            self._subtitle_widget.show_subtitle(speaker, text, translated)
-            self._position_subtitle()
-
     def shutdown(self) -> None:
         """Called on logout / disconnect — stop any local threads."""
         if self._engine.is_running():
             self._engine.stop("Shutdown")
         self._camera_engine.stop("Shutdown")
-        self._audio_engine.stop()
         self._executor.stop()
         self._remote_sender.detach()
-        self._subtitle_widget.clear()
         self._whiteboard_widget.clear_all()
 
     # ------------------------------------------------------------------
@@ -614,11 +555,6 @@ class ScreenShareWidget(QWidget):
             self._controller_user_id = None
             self._controller_username = ""
             self._refresh_controls()
-
-    def _on_mute_toggled(self) -> None:
-        muted = self._mute_btn.isChecked()
-        self._audio_engine.set_muted(muted)
-        self._mute_btn.setText("\U0001F507 Unmute" if muted else "\U0001F3A4 Mute")
 
     def _on_camera_toggled(self) -> None:
         if self._camera_btn.isChecked():
@@ -752,7 +688,6 @@ class ScreenShareWidget(QWidget):
 
         self._share_btn.setEnabled(in_room and not someone_sharing)
         self._stop_btn.setEnabled(we_share)
-        self._mute_btn.setEnabled(in_room)
         self._camera_btn.setEnabled(in_room)
         self._request_btn.setEnabled(
             in_room and someone_sharing and not we_share and self._controller_user_id is None,
@@ -957,18 +892,6 @@ class ScreenShareWidget(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        # Position subtitle overlay at the bottom-center of stacked view
-        if hasattr(self, "_subtitle_widget") and self._subtitle_widget.isVisible():
-            self._position_subtitle()
-
-    def _position_subtitle(self) -> None:
-        sw = self._subtitle_widget.width()
-        sh = self._subtitle_widget.sizeHint().height()
-        # center horizontally relative to stacked view, place near bottom
-        geom = self._stacked_view.geometry()
-        x = geom.x() + (geom.width() - sw) // 2
-        y = geom.y() + geom.height() - sh - 16
-        self._subtitle_widget.move(max(0, x), max(0, y))
 
     def _on_local_frame_captured(self, image: QImage) -> None:
         if self._engine.is_running():

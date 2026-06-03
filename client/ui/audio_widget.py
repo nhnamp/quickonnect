@@ -23,14 +23,21 @@ class AudioWidget(QWidget):
 
     send_packet = pyqtSignal(int, dict)
 
-    def __init__(self, connection_manager, user_id: int, username: str, parent=None) -> None:
+    def __init__(
+        self,
+        connection_manager,
+        user_id: int,
+        username: str,
+        audio_engine: AudioEngine | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._conn = connection_manager
         self._user_id = user_id
         self._username = username
         self._room_code: str | None = None
         self._last_error = ""
-        self._engine = AudioEngine(connection_manager)
+        self._engine = audio_engine or AudioEngine(connection_manager)
         self._build_ui()
         self._diag_timer = QTimer(self)
         self._diag_timer.timeout.connect(self._refresh_diagnostics)
@@ -82,7 +89,7 @@ class AudioWidget(QWidget):
         self._room_code = room_code
         self._last_error = ""
         self._subtitle_list.clear()
-        if self._room_code:
+        if self._room_code and self._audio_allowed_for_room(self._room_code):
             self._start_audio(show_dialog=False)
         self._refresh_controls()
 
@@ -119,6 +126,17 @@ class AudioWidget(QWidget):
             if show_dialog:
                 QMessageBox.information(self, "Audio", "Select a room in Chat first.")
             return
+        if not self._audio_allowed_for_room(self._room_code):
+            self._last_error = "Audio is disabled for direct-message rooms."
+            self._status_label.setText(self._last_error)
+            if show_dialog:
+                QMessageBox.information(
+                    self,
+                    "Audio",
+                    "Audio is only available in regular rooms. Direct-message rooms may be split across servers.",
+                )
+            self._refresh_controls()
+            return
         if self._engine.is_running():
             self._refresh_controls()
             return
@@ -146,16 +164,19 @@ class AudioWidget(QWidget):
 
     def _refresh_controls(self) -> None:
         in_room = self._room_code is not None
+        audio_allowed = in_room and self._audio_allowed_for_room(self._room_code or "")
         running = self._engine.is_running()
         muted = self._engine.is_muted()
 
-        self._join_btn.setEnabled(in_room and not running)
+        self._join_btn.setEnabled(audio_allowed and not running)
         self._leave_btn.setEnabled(running)
         self._mute_btn.setEnabled(running)
         self._mute_btn.setText("Unmute" if muted else "Mute")
 
         if not in_room:
             self._status_label.setText("Select a room in Chat to start audio.")
+        elif not audio_allowed:
+            self._status_label.setText("Audio is disabled for direct-message rooms.")
         elif running:
             state = "muted" if muted else "live"
             self._status_label.setText(f"Room {self._room_code}: audio {state}.")
@@ -170,6 +191,10 @@ class AudioWidget(QWidget):
         level = max(0, min(100, int((rms / 32768.0) * 200)))
         self._level.setValue(level if diag.get("running") else 0)
         self._queue_label.setText(f"Buffer: {diag.get('playback_queue', 0)}")
+
+    @staticmethod
+    def _audio_allowed_for_room(room_code: str) -> bool:
+        return not room_code.startswith("DM-")
 
     @staticmethod
     def _render_subtitle_lines(payload: dict) -> list[str]:

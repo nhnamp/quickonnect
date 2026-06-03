@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QApplication
 
 from client.config import ClientConfig
 from client.network.connection import ConnectionManager
-import client.network.lb_client
+import client.network.lb_client as lb_client
 from client.storage.local_store import LocalStore
 from client.ui.login_window import LoginWindow
 from client.ui.main_window import MainWindow
@@ -36,15 +36,15 @@ class App:
         def direct_server(host: str, port: int, room_code: str | None = None) -> tuple[str, int]:
             return host, port
 
-        client.network.lb_client.request_server = direct_server
+        lb_client.request_server = direct_server
         try:
-            import client.ui.login_window
-            client.ui.login_window.request_server = direct_server
+            import client.ui.login_window as login_window
+            login_window.request_server = direct_server
         except ImportError:
             pass
         try:
-            import client.ui.main_window
-            client.ui.main_window.request_server = direct_server
+            import client.ui.main_window as main_window
+            main_window.request_server = direct_server
         except ImportError:
             pass
 
