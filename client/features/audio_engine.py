@@ -111,6 +111,8 @@ class AudioEngine:
         self._capture_sent = 0
         self._playback_received = 0
         self._playback_written = 0
+        self._last_peak = 0
+        self._last_rms = 0
 
         self._capture_thread: threading.Thread | None = None
         self._playback_thread: threading.Thread | None = None
@@ -182,6 +184,10 @@ class AudioEngine:
             room_code, self._capture_thread is not None,
         )
         return True, self._input_error
+
+    def is_running(self) -> bool:
+        """Return True while capture/playback threads are active."""
+        return self._running
 
     def stop(self) -> None:
         """Stop both threads and release PyAudio resources."""
@@ -424,6 +430,23 @@ class AudioEngine:
         with self._mute_lock:
             return self._muted
 
+    def diagnostics(self) -> dict:
+        """Return lightweight UI diagnostics for the audio page."""
+        return {
+            "running": self._running,
+            "muted": self.is_muted(),
+            "room_code": self._room_code,
+            "capture_sent": self._capture_sent,
+            "playback_received": self._playback_received,
+            "playback_written": self._playback_written,
+            "playback_queue": self._playback_queue.qsize(),
+            "input_rate": self._input_rate,
+            "output_rate": self._output_rate,
+            "last_peak": self._last_peak,
+            "last_rms": self._last_rms,
+            "input_error": self._input_error,
+        }
+
     # ------------------------------------------------------------------
     # Playback feed (called from UI thread)
     # ------------------------------------------------------------------
@@ -510,8 +533,10 @@ class AudioEngine:
 
                 self._seq += 1
                 self._capture_sent += 1
+                peak, rms = self._pcm_peak_rms(pcm_data)
+                self._last_peak = peak
+                self._last_rms = rms
                 if self._capture_sent % 100 == 0:
-                    peak, rms = self._pcm_peak_rms(pcm_data)
                     logger.info(
                         "Audio capture sent %d frames room=%s rate=%d peak=%d rms=%d",
                         self._capture_sent, self._room_code, self._input_rate, peak, rms,

@@ -5,12 +5,9 @@ import random
 
 from shared.models import Room, Participant, RoomState
 from server.services.db import get_connection
-from server.features.screen_relay import ScreenRelayState
 from server.features.audio_mixer import AudioMixerState
 from server.features.stt_worker import STTManager
 from server.features.subtitle import SubtitleBroadcaster
-from server.features.whiteboard import WhiteboardState
-from server.features.camera_state import CameraState
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +34,7 @@ class RoomManager:
         self._server_id = server_id
         self._redis = redis_client
         self._lock = threading.Lock()
-        # room_code -> {"room": Room, "clients": {user_id: client_handler}}
+        # room_code -> {"room": Room, "clients": {user_id: client_handler}, "audio": AudioMixerState}
         self._rooms: dict[str, dict] = {}
 
     def create_room(self, user_id: int) -> Room | None:
@@ -60,29 +57,11 @@ class RoomManager:
         self._register_room_in_redis(room_code)
         return room
 
-    def get_screen_state(self, room_code: str) -> ScreenRelayState | None:
-        """Return the per-room ScreenRelayState, or None if the room is not active here."""
-        with self._lock:
-            room_data = self._rooms.get(room_code)
-            return room_data["screen"] if room_data else None
-
     def get_audio_mixer(self, room_code: str) -> AudioMixerState | None:
         """Return the per-room AudioMixerState, or None if the room is not active here."""
         with self._lock:
             room_data = self._rooms.get(room_code)
             return room_data["audio"] if room_data else None
-
-    def get_whiteboard_state(self, room_code: str) -> WhiteboardState | None:
-        """Return the per-room WhiteboardState, or None if the room is not active here."""
-        with self._lock:
-            room_data = self._rooms.get(room_code)
-            return room_data["whiteboard"] if room_data else None
-
-    def get_camera_state(self, room_code: str) -> CameraState | None:
-        """Return the per-room CameraState, or None if the room is not active here."""
-        with self._lock:
-            room_data = self._rooms.get(room_code)
-            return room_data["camera"] if room_data else None
 
     def join_room(self, room_code: str, user_id: int, username: str, client_handler) -> tuple[RoomState | None, str | None]:
         """
@@ -112,10 +91,7 @@ class RoomManager:
                 self._rooms[room_code] = {
                     "room": room,
                     "clients": {},
-                    "screen": ScreenRelayState(),
                     "audio": self._create_audio_state(room_code),
-                    "whiteboard": WhiteboardState(room.id, room_code),
-                    "camera": CameraState(),
                 }
                 if not dm:
                     self._register_room_in_redis(room_code)
@@ -140,9 +116,6 @@ class RoomManager:
             audio: AudioMixerState | None = room_data.get("audio")
             if audio is not None:
                 audio.remove_participant(user_id)
-            camera: CameraState | None = room_data.get("camera")
-            if camera is not None:
-                camera.stop_camera(user_id)
 
             room_data["clients"].pop(user_id, None)
             self._mark_participant_left(room_data["room"].id, user_id)
@@ -183,9 +156,6 @@ class RoomManager:
                     audio: AudioMixerState | None = room_data.get("audio")
                     if audio is not None:
                         audio.remove_participant(user_id)
-                    camera: CameraState | None = room_data.get("camera")
-                    if camera is not None:
-                        camera.stop_camera(user_id)
 
                     room_data["clients"].pop(user_id)
                     self._mark_participant_left(room_data["room"].id, user_id)
@@ -300,7 +270,7 @@ class RoomManager:
 
     @staticmethod
     def _stop_audio_state(room_data: dict) -> None:
-        """Stop all audio and whiteboard threads for a room that is being destroyed."""
+        """Stop all audio and subtitle workers for a room that is being destroyed."""
         audio: AudioMixerState | None = room_data.get("audio")
         if audio is not None:
             try:
@@ -310,10 +280,3 @@ class RoomManager:
                     stt.stop()
             except Exception:
                 logger.exception("Error stopping audio state")
-
-        wb = room_data.get("whiteboard")
-        if wb is not None:
-            try:
-                wb.stop()
-            except Exception:
-                logger.exception("Error stopping whiteboard state")

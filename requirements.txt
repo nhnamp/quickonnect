@@ -10,11 +10,7 @@ redis>=5.0.0
 # Client
 PyQt6>=6.6.0
 
-# Phase 2: screen sharing & remote control
-mss>=9.0.0
-pyautogui>=0.9.54
-
-# Phase 3: audio streaming & subtitles
+# Audio streaming & subtitles
 PyAudio>=0.2.14
 faster-whisper>=1.0.0  # optional: only needed if ENABLE_STT=1
 
